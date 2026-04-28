@@ -31,6 +31,8 @@ Point the dashboard at `VITE_BRIEHOST_API_URL=http://localhost:8000`.
 
 Runs in its own Proxmox LXC. The production container already has the env populated — `.env.example` is for local dev only.
 
+For an Ansible-based provisioning model (including zip malware scanning gates), see `ANSIBLE_PROVISIONING_APPROACH.md`.
+
 ## API
 
 ### `POST /api/sites/upload`
