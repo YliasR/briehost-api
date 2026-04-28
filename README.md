@@ -22,7 +22,7 @@ cp .env.example .env
 # fill in SUPABASE_*, PROXMOX_*, etc.
 
 # run
-uvicorn app.main:app --reload --port 8000
+API_PORT=8000 python -m app
 ```
 
 Point the dashboard at `VITE_BRIEHOST_API_URL=http://localhost:8000`.

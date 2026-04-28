@@ -89,6 +89,8 @@ PHP_TEMPLATE_VMID=...
 STORAGE_ROOT=/var/brieblast/clients
 MAX_UPLOAD_BYTES=104857600
 ALLOWED_ORIGINS=https://your-dashboard-domain
+API_HOST=0.0.0.0
+API_PORT=80
 ```
 
 ## 6) Run as a systemd service
@@ -104,7 +106,7 @@ After=network.target
 Type=simple
 WorkingDirectory=/opt/briehost-api
 EnvironmentFile=/opt/briehost-api/.env
-ExecStart=/opt/briehost-api/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+ExecStart=/opt/briehost-api/.venv/bin/python -m app
 Restart=always
 RestartSec=3
 User=root
@@ -123,13 +125,13 @@ systemctl enable --now briehost-api
 
 ## 7) Optional but recommended: reverse proxy + TLS
 
-Put Nginx/Caddy in front of port 8000 and expose only 80/443 externally.  
+Put Nginx/Caddy in front of the API port and expose only 80/443 externally.  
 Keep container firewall open only for required ports.
 
 ## 8) Health check
 
 ```bash
-curl http://127.0.0.1:8000/healthz
+curl http://127.0.0.1/healthz
 ```
 
 Expected response:

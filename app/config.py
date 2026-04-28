@@ -24,6 +24,8 @@ class Settings:
     allowed_origins: list[str] = [
         o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",") if o.strip()
     ]
+    api_host: str = os.getenv("API_HOST", "0.0.0.0")
+    api_port: int = int(os.getenv("API_PORT", "8000") or 8000)
 
 
 @lru_cache
