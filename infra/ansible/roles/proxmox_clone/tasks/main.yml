@@ -1,12 +1,60 @@
 ---
-# Clone the PHP LXC template into a new container.
-# TODO: implement using community.general.proxmox / proxmoxer.
-# Expected outcome: register `new_vmid` for downstream roles.
+# Clone the PHP LXC template into a fresh, thin-provisioned tenant container.
+# Networking: DHCP on tenant_bridge (OPNsense hands out the lease).
+# Storage: tenant_disk_storage (local-lvm by default — thin provisioned).
 
-- name: Placeholder — clone template (to be implemented)
-  ansible.builtin.debug:
-    msg: "Would clone template_vmid={{ template_vmid }} on node={{ target_node }} for site_id={{ site_id }}"
+- name: Pick the next free VMID
+  community.general.proxmox_vmid:
+    api_host: "{{ proxmox_api_host }}"
+    api_user: "{{ proxmox_api_user }}"
+    api_token_id: "{{ proxmox_api_token_id }}"
+    api_token_secret: "{{ proxmox_api_token_secret }}"
+  register: vmid_alloc
 
-- name: Set new_vmid (placeholder)
+- name: Set new_vmid fact
   ansible.builtin.set_fact:
-    new_vmid: 0
+    new_vmid: "{{ vmid_alloc.vmid }}"
+
+- name: Clone PHP template -> tenant CT (full clone, thin where supported)
+  community.general.proxmox:
+    api_host: "{{ proxmox_api_host }}"
+    api_user: "{{ proxmox_api_user }}"
+    api_token_id: "{{ proxmox_api_token_id }}"
+    api_token_secret: "{{ proxmox_api_token_secret }}"
+    node: "{{ target_node }}"
+    vmid: "{{ template_vmid }}"
+    newid: "{{ new_vmid }}"
+    clone: "{{ template_vmid }}"
+    clone_type: full
+    storage: "{{ tenant_disk_storage }}"
+    pool: "{{ tenant_pool }}"
+    hostname: "{{ tenant_hostname }}"
+    timeout: 300
+  register: clone_result
+
+- name: Configure tenant CT resources + network (DHCP via OPNsense)
+  community.general.proxmox:
+    api_host: "{{ proxmox_api_host }}"
+    api_user: "{{ proxmox_api_user }}"
+    api_token_id: "{{ proxmox_api_token_id }}"
+    api_token_secret: "{{ proxmox_api_token_secret }}"
+    node: "{{ target_node }}"
+    vmid: "{{ new_vmid }}"
+    update: true
+    cores: "{{ tenant_cores }}"
+    memory: "{{ tenant_memory_mb }}"
+    swap: "{{ tenant_swap_mb }}"
+    onboot: true
+    netif:
+      net0: "name=eth0,bridge={{ tenant_bridge }},ip=dhcp,firewall=1"
+    # Tag for ops visibility — e.g. `pct list` filtering, Proxmox UI search.
+    description: "briehost site_id={{ site_id }} user_id={{ user_id }}"
+
+- name: Grow root disk to {{ tenant_disk_gb }}G (no-op if template is already that size)
+  ansible.builtin.command: pct resize {{ new_vmid }} rootfs {{ tenant_disk_gb }}G
+  changed_when: "'unable to shrink' not in resize_out.stderr | default('')"
+  failed_when:
+    - resize_out.rc != 0
+    - "'already' not in resize_out.stderr | default('')"
+    - "'unable to shrink' not in resize_out.stderr | default('')"
+  register: resize_out

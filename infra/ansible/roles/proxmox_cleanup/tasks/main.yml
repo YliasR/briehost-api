@@ -1,0 +1,38 @@
+---
+# Destroy any tenant CT left behind by a prior failed run for this site_id.
+# We tag every CT we create with `description: "briehost site_id=<uuid> ..."`
+# (see proxmox_clone). That tag is the only thing we match on — never destroy
+# anything that wasn't ours.
+
+- name: Find leftover tenant CTs for this site_id
+  ansible.builtin.shell: |
+    set -o pipefail
+    for vmid in $(pct list | awk 'NR>1 {print $1}'); do
+      if pct config "$vmid" 2>/dev/null | grep -qE "^description:.*\\bsite_id={{ site_id }}\\b"; then
+        echo "$vmid"
+      fi
+    done
+  args:
+    executable: /bin/bash
+  register: stale_vmids
+  changed_when: false
+
+- name: Stop leftover tenant CTs (best-effort)
+  ansible.builtin.command: pct stop {{ item }}
+  loop: "{{ stale_vmids.stdout_lines }}"
+  changed_when: true
+  failed_when: false
+
+- name: Destroy leftover tenant CTs
+  ansible.builtin.command: pct destroy {{ item }} --purge --force
+  loop: "{{ stale_vmids.stdout_lines }}"
+  changed_when: true
+
+- name: Cleanup summary
+  ansible.builtin.debug:
+    msg: >-
+      {% if stale_vmids.stdout_lines | length > 0 %}
+      Removed stale tenant CTs for site_id={{ site_id }}: {{ stale_vmids.stdout_lines | join(', ') }}
+      {% else %}
+      No stale tenant CTs for site_id={{ site_id }}.
+      {% endif %}

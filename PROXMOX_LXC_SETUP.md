@@ -1,5 +1,106 @@
 # Proxmox LXC recommendation for `briehost-api`
 
+## Manual prerequisites (do these before the API can provision anything)
+
+The API CT can do nothing on Proxmox without these in place. Each one is a one-time setup; the playbooks assume them.
+
+### A. Tenant network behind OPNsense
+
+- A dedicated bridge for tenant CTs (e.g. `vmbr1`), with its only "wire" being the OPNsense LAN-side interface.
+- OPNsense has **DHCP enabled** on that interface, leasing from a pool large enough for your max concurrent sites.
+- (Eventual public exposure) port-forward `:80`/`:443` from OPNsense WAN → a frontend reverse-proxy CT (Caddy/Nginx) on the same `vmbr1`. Tenant CTs are *not* exposed directly.
+- Confirm: a manual test CT on `vmbr1` gets a DHCP lease and can `curl https://example.com`.
+
+### B. Proxmox API token for briehost
+
+In the Proxmox UI:
+
+1. **Datacenter → Permissions → Users**: create user `briehost@pve` (or reuse `root@pam` for the lab; not recommended for prod).
+2. **Datacenter → Permissions → API Tokens**: create token `briehost` for that user, **uncheck "Privilege Separation"** for the lab (or grant matching ACLs to the token explicitly).
+3. **Datacenter → Permissions**: add ACL on path `/pool/briehost` for that user/token with role `PVEVMAdmin` (covers Allocate, Clone, Config, PowerMgmt, Audit). Add `PVEDatastoreUser` on `/storage/local-lvm` so it can clone disks.
+4. Put the token id and secret into the API CT's `.env` as `PROXMOX_TOKEN_ID` / `PROXMOX_TOKEN_SECRET`.
+
+### C. SSH from the API CT to the Proxmox host
+
+The token alone can't `pct push` files. The playbooks SSH into the Proxmox host as root.
+
+```bash
+# on the API CT
+ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519
+ssh-copy-id root@<proxmox-host>
+```
+
+On the Proxmox host, lock the key down in `/root/.ssh/authorized_keys`:
+
+```
+from="<api-ct-ip>",no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAA... briehost-api
+```
+
+Smoke test from the API CT:
+
+```bash
+ansible -i /opt/briehost-api/infra/ansible/inventory/production.ini proxmox -m ping
+```
+
+### D. Tenant resource pool
+
+```text
+Datacenter → Permissions → Pools → Create → "briehost"
+```
+
+The token's ACL from step B is scoped to this pool, so all tenant CTs land in it and the token can't touch anything else.
+
+### E. PHP "golden" template CT
+
+The tenant CTs are full clones of this. Build it once, snapshot, convert to template:
+
+1. Create an unprivileged Debian 12 CT, hostname `tpl-php`, on `vmbr1`, **8 GB thin-provisioned disk** on `local-lvm`, 1 vCPU / 512 MB.
+2. Inside it:
+   ```bash
+   apt update
+   apt install -y nginx php-fpm php-cli php-mbstring php-xml php-curl php-zip unzip
+   rm -f /etc/nginx/sites-enabled/default
+   ```
+3. Drop a minimal vhost at `/etc/nginx/sites-available/site.conf`:
+   ```nginx
+   server {
+       listen 80 default_server;
+       server_name _;
+       root /var/www/html;
+       index index.php index.html;
+       location / { try_files $uri $uri/ /index.php?$query_string; }
+       location ~ \.php$ {
+           include snippets/fastcgi-php.conf;
+           fastcgi_pass unix:/run/php/php-fpm.sock;
+       }
+   }
+   ```
+   ```bash
+   ln -s /etc/nginx/sites-available/site.conf /etc/nginx/sites-enabled/site.conf
+   systemctl enable --now nginx php*-fpm
+   chown -R www-data:www-data /var/www/html
+   ```
+4. Stop the CT, then **right-click → Convert to template** (or `pct template <vmid>` from the host).
+5. Note the VMID. Put it in the API CT's `.env` as `PHP_TEMPLATE_VMID`.
+
+### F. Variables to set in `infra/ansible/inventory/group_vars/proxmox.yml`
+
+Most defaults work; the ones you'll likely change:
+
+- `tenant_bridge` → must match the OPNsense-facing bridge from step A (default `vmbr1`).
+- `tenant_disk_storage` → storage id where tenant disks live (default `local-lvm`, thin-provisioned).
+- `tenant_disk_gb` → bumped to `8` per your call. Raise here if customers need more.
+
+### G. Public hostnames (for later, when sites go public)
+
+Out of scope for the first cut — when you're ready:
+
+- Wildcard DNS `*.briehost.tld → <opnsense WAN IP>`.
+- Frontend reverse-proxy CT (Caddy with `on_demand_tls` is the lowest-effort) that the `healthcheck` role writes vhost config into and reloads.
+- The role currently only HTTP-checks the tenant IP; extending it to also push proxy config is the next step once DNS/TLS is decided.
+
+---
+
 ## Recommended container profile (efficient + production-safe)
 
 Use an **unprivileged Debian 12 LXC** (minimal template) for this API service.
@@ -161,7 +262,21 @@ ssh-copy-id root@<proxmox-host>
 ansible -i /opt/briehost-api/infra/ansible/inventory/production.ini proxmox -m ping
 ```
 
-The roles under `infra/ansible/roles/{proxmox_clone,deploy_site_zip,start_container,healthcheck}` are scaffolded as placeholders — fill them in with the real `community.general.proxmox` / `pct` calls before going live.
+Install the Proxmox collection on the API CT once:
+
+```bash
+ansible-galaxy collection install community.general
+```
+
+The roles under `infra/ansible/roles/{proxmox_cleanup,proxmox_clone,start_container,deploy_site_zip,healthcheck}` are wired up:
+
+- `proxmox_cleanup` — destroys any tenant CT left behind by a prior failed run for the same `site_id` (matches on the `description: briehost site_id=<uuid>` tag we set on every CT we create — never touches anything else).
+- `proxmox_clone` — picks a free VMID, full-clones the PHP template into the `briehost` pool, configures cores/memory/swap and a DHCP NIC on `tenant_bridge`, grows rootfs to `tenant_disk_gb`.
+- `start_container` — starts the CT, waits for `pct exec` to work, polls until OPNsense hands out a DHCP lease, records `tenant_ip`.
+- `deploy_site_zip` — `pct push`es the validated zip into the tenant CT, unzips into `/var/www/html`, fixes ownership, reloads php-fpm.
+- `healthcheck` — `uri` GET against `tenant_ip` until it returns < 500.
+
+Defaults (per-tenant: 1 vCPU / 512 MB / 8 GB thin disk, bridge `vmbr1`, storage `local-lvm`, pool `briehost`) live in `infra/ansible/inventory/group_vars/proxmox.yml`.
 
 ## 8) Run as a systemd service
 

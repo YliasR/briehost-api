@@ -1,7 +1,42 @@
 ---
-# Push the uploaded zip into the new container at /var/www/html.
-# TODO: extract on the Proxmox node, then `pct push` or rsync into the CT.
+# Push the validated zip from the API CT into the tenant CT and unpack into /var/www/html.
+# Pre-conditions: tenant CT is running (start_container ran first).
 
-- name: Placeholder — deploy zip (to be implemented)
-  ansible.builtin.debug:
-    msg: "Would deploy {{ zip_path }} into vmid={{ new_vmid }}"
+- name: Stage zip on Proxmox host
+  ansible.builtin.copy:
+    src: "{{ zip_path }}"      # absolute path on the API CT (control node)
+    dest: "/tmp/briehost-{{ site_id }}.zip"
+    mode: "0600"
+
+- name: Ensure docroot is empty inside tenant CT
+  ansible.builtin.command: pct exec {{ new_vmid }} -- bash -lc 'rm -rf /var/www/html/* /var/www/html/.[!.]* 2>/dev/null || true'
+  changed_when: true
+
+- name: Push staged zip into tenant CT
+  ansible.builtin.command: >
+    pct push {{ new_vmid }}
+    /tmp/briehost-{{ site_id }}.zip
+    /tmp/site.zip
+  changed_when: true
+
+- name: Unzip inside tenant CT
+  ansible.builtin.command: pct exec {{ new_vmid }} -- unzip -q /tmp/site.zip -d /var/www/html
+  changed_when: true
+
+- name: Fix ownership for php-fpm
+  ansible.builtin.command: pct exec {{ new_vmid }} -- chown -R www-data:www-data /var/www/html
+  changed_when: true
+
+- name: Reload php-fpm so opcache picks up new files
+  ansible.builtin.command: pct exec {{ new_vmid }} -- systemctl reload php-fpm
+  changed_when: true
+  failed_when: false   # service name varies (php8.2-fpm etc); reload is best-effort
+
+- name: Clean up staged zip on host
+  ansible.builtin.file:
+    path: "/tmp/briehost-{{ site_id }}.zip"
+    state: absent
+
+- name: Clean up zip inside tenant CT
+  ansible.builtin.command: pct exec {{ new_vmid }} -- rm -f /tmp/site.zip
+  changed_when: true

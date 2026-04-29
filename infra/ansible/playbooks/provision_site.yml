@@ -29,7 +29,8 @@
         fail_msg: "Missing or invalid extra-vars for provisioning"
 
   roles:
+    - proxmox_cleanup
     - proxmox_clone
-    - deploy_site_zip
     - start_container
+    - deploy_site_zip
     - healthcheck
