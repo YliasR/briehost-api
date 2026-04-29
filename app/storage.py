@@ -52,9 +52,13 @@ def validate_zip_policy(
             if (member.external_attr >> 16) & 0o170000 == 0o120000:
                 raise UnsafeZipError(f"Symlink not allowed: {member.filename}")
 
-            normalized = os.path.normpath(member.filename).replace("\\", "/")
+            # Normalize separators first so backslash-prefixed members can't sneak past.
+            unified = member.filename.replace("\\", "/")
+            normalized = os.path.normpath(unified).replace("\\", "/")
+            drive_prefixed = len(unified) >= 2 and unified[1] == ":" and unified[0].isalpha()
             if (
-                os.path.isabs(member.filename)
+                normalized.startswith("/")
+                or drive_prefixed
                 or normalized.startswith("../")
                 or normalized == ".."
                 or "/../" in normalized

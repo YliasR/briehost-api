@@ -10,6 +10,7 @@ import json
 import logging
 import shlex
 import subprocess
+import threading
 import zipfile
 from pathlib import Path
 
@@ -28,7 +29,32 @@ STATUS_PROVISIONING = "provisioning"
 STATUS_LIVE = "live"
 STATUS_FAILED = "failed"
 
+SUPPORTED_BACKENDS = {"ansible"}
+
 _TRIM = 4000  # cap for stderr/stdout we persist
+
+# In-process gauge of provisions currently running. Used by the route as
+# crude backpressure (reject new uploads at capacity). Not durable across
+# restarts — proper backpressure belongs in a real job queue.
+_inflight_lock = threading.Lock()
+_inflight = 0
+
+
+def inflight_count() -> int:
+    with _inflight_lock:
+        return _inflight
+
+
+def _inflight_inc() -> None:
+    global _inflight
+    with _inflight_lock:
+        _inflight += 1
+
+
+def _inflight_dec() -> None:
+    global _inflight
+    with _inflight_lock:
+        _inflight = max(0, _inflight - 1)
 
 
 def _set_status(site_id: str, status: str, error: str | None = None) -> None:
@@ -47,7 +73,9 @@ def _set_status_safe(site_id: str, status: str, error: str | None = None) -> Non
         log.exception("could not persist final status for site_id=%s", site_id)
 
 
-def _run_ansible(settings: Settings, site_id: str, user_id: str, zip_path: Path) -> tuple[int, str, str]:
+def _run_ansible(
+    settings: Settings, site_id: str, user_id: str, zip_path: Path
+) -> tuple[int, str, str]:
     extra_vars: dict[str, object] = {
         "site_id": site_id,
         "user_id": user_id,
@@ -69,13 +97,28 @@ def _run_ansible(settings: Settings, site_id: str, user_id: str, zip_path: Path)
         json.dumps(extra_vars),
     ]
     log.info("running: %s", " ".join(shlex.quote(c) for c in cmd))
-    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    proc = subprocess.run(
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=settings.ansible_timeout_seconds,
+    )
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
 def provision_site(settings: Settings, site_id: str, user_id: str, zip_path: Path) -> None:
     """Full pipeline for one upload. Safe to run as a fire-and-forget task."""
+    _inflight_inc()
     try:
+        if settings.provisioner_backend not in SUPPORTED_BACKENDS:
+            _set_status(
+                site_id,
+                STATUS_FAILED,
+                f"unsupported provisioner backend: {settings.provisioner_backend!r}",
+            )
+            return
+
         _set_status(site_id, STATUS_SCANNING)
 
         try:
@@ -113,7 +156,16 @@ def provision_site(settings: Settings, site_id: str, user_id: str, zip_path: Pat
 
         _set_status(site_id, STATUS_PROVISIONING)
 
-        rc, stdout, stderr = _run_ansible(settings, site_id, user_id, zip_path)
+        try:
+            rc, stdout, stderr = _run_ansible(settings, site_id, user_id, zip_path)
+        except subprocess.TimeoutExpired as exc:
+            _set_status(
+                site_id,
+                STATUS_FAILED,
+                f"ansible timed out after {settings.ansible_timeout_seconds}s: {exc}",
+            )
+            return
+
         if rc == 0:
             _set_status(site_id, STATUS_LIVE)
         else:
@@ -122,6 +174,8 @@ def provision_site(settings: Settings, site_id: str, user_id: str, zip_path: Pat
     except Exception as exc:  # noqa: BLE001 — last-resort guard so worker never crashes silently
         log.exception("provisioning crashed for site_id=%s", site_id)
         _set_status_safe(site_id, STATUS_FAILED, f"worker crash: {exc}")
+    finally:
+        _inflight_dec()
 
 
 def enqueue_provision(

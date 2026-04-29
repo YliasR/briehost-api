@@ -34,6 +34,12 @@ class Settings:
         "ANSIBLE_INVENTORY_PATH", "infra/ansible/inventory/production.ini"
     )
     ansible_extra_vars_json: str = os.getenv("ANSIBLE_EXTRA_VARS_JSON", "{}")
+    # Hard wall-clock cap on a single ansible-playbook run so the worker thread
+    # can't block forever on a stuck SSH/lock/etc. Default: 30 min.
+    ansible_timeout_seconds: int = int(os.getenv("ANSIBLE_TIMEOUT_SECONDS", "1800") or 1800)
+    # Backpressure: max concurrent provisioning jobs. New uploads beyond this
+    # are rejected with 503 until in-flight jobs drain. Real fix is a job queue.
+    max_concurrent_provisions: int = int(os.getenv("MAX_CONCURRENT_PROVISIONS", "3") or 3)
 
     # Malware / zip policy
     enable_malware_scan: bool = _bool("ENABLE_MALWARE_SCAN", "true")
