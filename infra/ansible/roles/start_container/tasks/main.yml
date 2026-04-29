@@ -1,0 +1,7 @@
+---
+# Start the new container.
+# TODO: `pct start {{ new_vmid }}` (community.general.proxmox or shell module).
+
+- name: Placeholder — start container (to be implemented)
+  ansible.builtin.debug:
+    msg: "Would start vmid={{ new_vmid }}"

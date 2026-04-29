@@ -50,12 +50,37 @@ Since you do not have Proxmox host shell access, keep uploads on the CT root dis
 mkdir -p /var/brieblast/clients
 ```
 
+Uploads land here as `<user_id>/<slug>-<site_id>.zip` — slug is derived from the original filename so listings stay human-readable, the UUID guarantees uniqueness.
+
 ## 3) Base packages inside container
 
 ```bash
 apt update
-apt install -y python3 python3-venv python3-pip curl git
+apt install -y python3 python3-venv python3-pip curl git \
+               ansible \
+               clamav clamav-daemon
 ```
+
+`ansible` runs the provisioning playbooks. `clamav-daemon` provides `clamd`, used by the upload scanner.
+
+Initial ClamAV setup:
+
+```bash
+systemctl stop clamav-freshclam
+freshclam                       # one-shot signature pull
+systemctl enable --now clamav-freshclam   # background updates
+systemctl enable --now clamav-daemon
+ss -ltnp | grep 3310            # confirm clamd is listening on TCP/3310
+```
+
+If `clamd` is bound to a unix socket only by default, edit `/etc/clamav/clamd.conf` to enable TCP:
+
+```conf
+TCPSocket 3310
+TCPAddr 127.0.0.1
+```
+
+Then `systemctl restart clamav-daemon`.
 
 ## 4) Deploy app
 
@@ -70,9 +95,26 @@ pip install --upgrade pip
 pip install -e .
 ```
 
-## 5) Configure environment
+## 5) Apply Supabase schema
 
-Create `/opt/briehost-api/.env`:
+The SQL migrations live in the dashboard repo (`brieblast-landing/supabase/migrations/`):
+
+- `001_create_profiles.sql`
+- `002_create_sites.sql`
+
+Apply both via the Supabase SQL editor or `supabase db push`. After 002 is applied, run the API-repo migration that **widens the `sites.status` CHECK constraint** to cover the scanning states the worker now writes:
+
+```bash
+# from the briehost-api repo
+psql "$SUPABASE_DB_URL" -f sql/003_widen_sites_status.sql
+# or paste sql/003_widen_sites_status.sql into the Supabase SQL editor
+```
+
+`error_message` is already in the schema; the worker writes scan/ansible failure tails there.
+
+## 6) Configure environment
+
+Create `/opt/briehost-api/.env` (see `.env.example` for the full list):
 
 ```env
 SUPABASE_URL=...
@@ -88,19 +130,48 @@ PHP_TEMPLATE_VMID=...
 
 STORAGE_ROOT=/var/brieblast/clients
 MAX_UPLOAD_BYTES=104857600
+
+# Provisioning
+PROVISIONER_BACKEND=ansible
+ANSIBLE_PLAYBOOK_PATH=/opt/briehost-api/infra/ansible/playbooks/provision_site.yml
+ANSIBLE_INVENTORY_PATH=/opt/briehost-api/infra/ansible/inventory/production.ini
+
+# Malware scan + zip policy
+ENABLE_MALWARE_SCAN=true
+CLAMD_HOST=127.0.0.1
+CLAMD_PORT=3310
+MAX_ZIP_FILES=5000
+MAX_ZIP_UNCOMPRESSED_BYTES=524288000
+MAX_ZIP_COMPRESSION_RATIO=200
+
 ALLOWED_ORIGINS=https://your-dashboard-domain
 API_HOST=0.0.0.0
 API_PORT=80
 ```
 
-## 6) Run as a systemd service
+Use absolute paths for `ANSIBLE_PLAYBOOK_PATH` / `ANSIBLE_INVENTORY_PATH` since the systemd unit's working directory may differ from where you run things by hand.
+
+## 7) Wire up Ansible against Proxmox
+
+Edit `/opt/briehost-api/infra/ansible/inventory/production.ini` so the `[proxmox]` host points at your real node, with an SSH user that can run `pct` (typically `root`). Drop the matching SSH key into the CT and authorize it on the Proxmox host:
+
+```bash
+ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519
+ssh-copy-id root@<proxmox-host>
+ansible -i /opt/briehost-api/infra/ansible/inventory/production.ini proxmox -m ping
+```
+
+The roles under `infra/ansible/roles/{proxmox_clone,deploy_site_zip,start_container,healthcheck}` are scaffolded as placeholders — fill them in with the real `community.general.proxmox` / `pct` calls before going live.
+
+## 8) Run as a systemd service
 
 Create `/etc/systemd/system/briehost-api.service`:
 
 ```ini
 [Unit]
 Description=briehost-api (FastAPI)
-After=network.target
+After=network.target clamav-daemon.service
+Wants=clamav-daemon.service
 
 [Service]
 Type=simple
@@ -123,12 +194,12 @@ systemctl daemon-reload
 systemctl enable --now briehost-api
 ```
 
-## 7) Optional but recommended: reverse proxy + TLS
+## 9) Optional but recommended: reverse proxy + TLS
 
-Put Nginx/Caddy in front of the API port and expose only 80/443 externally.  
+Put Nginx/Caddy in front of the API port and expose only 80/443 externally.
 Keep container firewall open only for required ports.
 
-## 8) Health check
+## 10) Health check
 
 ```bash
 curl http://127.0.0.1/healthz
@@ -140,7 +211,18 @@ Expected response:
 {"status":"ok"}
 ```
 
+End-to-end smoke test (uploads a tiny zip, watches the row transition):
+
+```bash
+echo '<?php echo "hi"; ?>' > index.php && zip /tmp/smoke.zip index.php
+curl -H "Authorization: Bearer <supabase-jwt>" \
+     -F file=@/tmp/smoke.zip \
+     http://127.0.0.1/api/sites/upload
+# then watch status in Supabase: uploaded -> scanning -> provisioning -> live
+```
+
 ## Notes specific to this repository
 
-- This repo currently has a provisioning stub in `app/proxmox.py` (`NotImplementedError`), so clone/start behavior will not work until that logic is implemented.
-- Upload and storage paths are already designed for LXC usage via `STORAGE_ROOT`.
+- Provisioning is now Ansible-driven (`app/worker.py` + `infra/ansible/`). The old `app/proxmox.py` is a deprecation marker — see `ANSIBLE_PROVISIONING_APPROACH.md` for the design.
+- Upload and storage paths are designed for LXC usage via `STORAGE_ROOT`; stored filenames are `<slug>-<site_id>.zip` for human-readable directory listings.
+- `ENABLE_MALWARE_SCAN=true` fails closed: if `clamd` is unreachable, uploads land in `scan_failed` rather than slipping through.

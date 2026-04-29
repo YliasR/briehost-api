@@ -1,0 +1,7 @@
+---
+# Push the uploaded zip into the new container at /var/www/html.
+# TODO: extract on the Proxmox node, then `pct push` or rsync into the CT.
+
+- name: Placeholder — deploy zip (to be implemented)
+  ansible.builtin.debug:
+    msg: "Would deploy {{ zip_path }} into vmid={{ new_vmid }}"

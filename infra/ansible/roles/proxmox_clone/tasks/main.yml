@@ -1,0 +1,12 @@
+---
+# Clone the PHP LXC template into a new container.
+# TODO: implement using community.general.proxmox / proxmoxer.
+# Expected outcome: register `new_vmid` for downstream roles.
+
+- name: Placeholder — clone template (to be implemented)
+  ansible.builtin.debug:
+    msg: "Would clone template_vmid={{ template_vmid }} on node={{ target_node }} for site_id={{ site_id }}"
+
+- name: Set new_vmid (placeholder)
+  ansible.builtin.set_fact:
+    new_vmid: 0

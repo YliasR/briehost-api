@@ -1,0 +1,35 @@
+---
+# Provision a PHP site into a fresh Proxmox LXC clone and start it.
+#
+# Required extra vars (passed by app/worker.py):
+#   site_id        UUID of the site row in Supabase
+#   user_id        UUID of the owning user
+#   zip_path       Absolute path on the API host to the validated zip
+#   target_node    Proxmox node name (e.g. "pve")
+#   template_vmid  VMID of the PHP LXC template to clone
+#
+# Optional:
+#   site_name      Human-readable display name (logging only)
+
+- name: Provision PHP site
+  hosts: proxmox
+  gather_facts: false
+  vars:
+    site_name: "{{ site_name | default(site_id) }}"
+
+  pre_tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - site_id is defined and site_id | length > 0
+          - user_id is defined and user_id | length > 0
+          - zip_path is defined and zip_path | length > 0
+          - target_node is defined and target_node | length > 0
+          - template_vmid is defined and (template_vmid | int) > 0
+        fail_msg: "Missing or invalid extra-vars for provisioning"
+
+  roles:
+    - proxmox_clone
+    - deploy_site_zip
+    - start_container
+    - healthcheck

@@ -1,0 +1,7 @@
+---
+# Verify the container responds on port 80 before reporting success.
+# TODO: poll http://<container-ip>/ until 2xx or fail after timeout.
+
+- name: Placeholder — healthcheck (to be implemented)
+  ansible.builtin.debug:
+    msg: "Would healthcheck vmid={{ new_vmid }}"
