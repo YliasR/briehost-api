@@ -1,5 +1,6 @@
 ---
-# Push the validated zip from the API CT into the tenant CT and unpack into /var/www/html.
+# Push the validated zip from the API CT into the tenant CT and run the in-CT
+# deploy script (installed in the golden PHP template at /usr/local/bin/deploy-site.sh).
 # Pre-conditions: tenant CT is running (start_container ran first).
 
 - name: Stage zip on Proxmox host
@@ -8,10 +9,6 @@
     dest: "/tmp/briehost-{{ site_id }}.zip"
     mode: "0600"
 
-- name: Ensure docroot is empty inside tenant CT
-  ansible.builtin.command: pct exec {{ new_vmid }} -- bash -lc 'rm -rf /var/www/html/* /var/www/html/.[!.]* 2>/dev/null || true'
-  changed_when: true
-
 - name: Push staged zip into tenant CT
   ansible.builtin.command: >
     pct push {{ new_vmid }}
@@ -19,12 +16,8 @@
     /tmp/site.zip
   changed_when: true
 
-- name: Unzip inside tenant CT
-  ansible.builtin.command: pct exec {{ new_vmid }} -- unzip -q /tmp/site.zip -d /var/www/html
-  changed_when: true
-
-- name: Fix ownership for php-fpm
-  ansible.builtin.command: pct exec {{ new_vmid }} -- chown -R www-data:www-data /var/www/html
+- name: Run in-CT deploy script (wipes docroot, unzips, fixes perms)
+  ansible.builtin.command: pct exec {{ new_vmid }} -- /usr/local/bin/deploy-site.sh /tmp/site.zip
   changed_when: true
 
 - name: Reload php-fpm so opcache picks up new files

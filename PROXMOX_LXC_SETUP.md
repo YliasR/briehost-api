@@ -80,8 +80,39 @@ The tenant CTs are full clones of this. Build it once, snapshot, convert to temp
    systemctl enable --now nginx php*-fpm
    chown -R www-data:www-data /var/www/html
    ```
-4. Stop the CT, then **right-click → Convert to template** (or `pct template <vmid>` from the host).
-5. Note the VMID. Put it in the API CT's `.env` as `PHP_TEMPLATE_VMID`.
+4. Install the in-CT deploy script at `/usr/local/bin/deploy-site.sh` (the `deploy_site_zip` ansible role calls it after `pct push`):
+
+   ```bash
+   cat >/usr/local/bin/deploy-site.sh <<'EOF'
+   #!/bin/bash
+   # Usage: deploy-site.sh /path/to/file.zip
+   set -euo pipefail
+
+   ZIP_FILE="${1:-}"
+   WEB_ROOT="/var/www/html"
+
+   if [[ -z "$ZIP_FILE" ]]; then
+       echo "No zip file provided." >&2
+       exit 1
+   fi
+   if [[ ! -r "$ZIP_FILE" ]]; then
+       echo "Zip file not readable: $ZIP_FILE" >&2
+       exit 1
+   fi
+
+   rm -rf -- "${WEB_ROOT:?}"/* "${WEB_ROOT:?}"/.[!.]* 2>/dev/null || true
+   unzip -qq -o "$ZIP_FILE" -d "$WEB_ROOT"
+   chown -R www-data:www-data "$WEB_ROOT"
+   find "$WEB_ROOT" -type d -exec chmod 755 {} +
+   find "$WEB_ROOT" -type f -exec chmod 644 {} +
+
+   echo "Deployment OK"
+   EOF
+   chmod 0755 /usr/local/bin/deploy-site.sh
+   ```
+
+5. Stop the CT, then **right-click → Convert to template** (or `pct template <vmid>` from the host).
+6. Note the VMID. Put it in the API CT's `.env` as `PHP_TEMPLATE_VMID`.
 
 ### F. Variables to set in `infra/ansible/inventory/group_vars/proxmox.yml`
 
