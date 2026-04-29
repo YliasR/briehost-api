@@ -229,8 +229,8 @@ pip install --upgrade pip
 pip install -e .
 
 # Ansible (recent core) + collections used by the playbooks
-pip install "ansible>=10"
-ansible-galaxy collection install --force community.general
+pip install "ansible>=10" proxmoxer requests
+ansible-galaxy collection install --force community.proxmox community.general
 
 # Make venv ansible binaries the default on PATH so the worker's
 # subprocess.run("ansible-playbook", ...) finds the new version.

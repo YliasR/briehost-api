@@ -4,19 +4,16 @@
 # Storage: tenant_disk_storage (local-lvm by default — thin provisioned).
 
 - name: Pick the next free VMID
-  community.general.proxmox_vmid:
-    api_host: "{{ proxmox_api_host }}"
-    api_user: "{{ proxmox_api_user }}"
-    api_token_id: "{{ proxmox_api_token_id }}"
-    api_token_secret: "{{ proxmox_api_token_secret }}"
-  register: vmid_alloc
+  ansible.builtin.command: pvesh get /cluster/nextid
+  register: nextid_out
+  changed_when: false
 
 - name: Set new_vmid fact
   ansible.builtin.set_fact:
-    new_vmid: "{{ vmid_alloc.vmid }}"
+    new_vmid: "{{ nextid_out.stdout | trim }}"
 
 - name: Clone PHP template -> tenant CT (full clone, thin where supported)
-  community.general.proxmox:
+  community.proxmox.proxmox:
     api_host: "{{ proxmox_api_host }}"
     api_user: "{{ proxmox_api_user }}"
     api_token_id: "{{ proxmox_api_token_id }}"
@@ -33,7 +30,7 @@
   register: clone_result
 
 - name: Configure tenant CT resources + network (DHCP via OPNsense)
-  community.general.proxmox:
+  community.proxmox.proxmox:
     api_host: "{{ proxmox_api_host }}"
     api_user: "{{ proxmox_api_user }}"
     api_token_id: "{{ proxmox_api_token_id }}"

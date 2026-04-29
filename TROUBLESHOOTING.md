@@ -121,6 +121,7 @@ curl -sI "$SUPABASE_URL/rest/v1/sites?select=id&limit=1" \
 5. **`scan_failed: zip policy: Path traversal blocked`** on a legitimate zip — the customer zipped from the wrong directory and embedded an absolute path. Re-zip from inside the project root.
 6. **`failed: ansible rc=4: [WARNING]: Collection community.general does not support Ansible version`** — Debian's `apt install ansible` is too old. Install ansible in the venv (`pip install "ansible>=10"`) and symlink the binaries into `/usr/local/bin` (see `PROXMOX_LXC_SETUP.md` § 4). Verify with `ansible --version` (need core ≥ 2.17).
 7. **`failed: ansible rc=1: ERROR! the role 'X' was not found`** — `ansible.cfg` at the repo root not being picked up. The worker's `WorkingDirectory` must be the repo root (default `/opt/briehost-api`); confirm with `systemctl show -p WorkingDirectory briehost-api`.
+8. **`failed: ansible rc=4: couldn't resolve module/action 'community.general.proxmox*'`** — Proxmox modules moved out of `community.general` into the dedicated `community.proxmox` collection. Install it: `ansible-galaxy collection install --force community.proxmox` (and `pip install proxmoxer requests` if missing).
 
 ## Per-task ansible visibility (recommended)
 
