@@ -189,11 +189,12 @@ Uploads land here as `<user_id>/<slug>-<site_id>.zip` — slug is derived from t
 ```bash
 apt update
 apt install -y python3 python3-venv python3-pip curl git \
-               ansible \
                clamav clamav-daemon
 ```
 
-`ansible` runs the provisioning playbooks. `clamav-daemon` provides `clamd`, used by the upload scanner. Debian commonly starts it with a Unix socket at `/run/clamav/clamd.ctl`, which this app can use directly.
+> **Don't `apt install ansible`** — Debian 12 ships ansible-core 2.14, which is too old for current `community.general` (needs ≥ 2.17). Install ansible into the venv in step 4 instead.
+
+`clamav-daemon` provides `clamd`, used by the upload scanner. Debian commonly starts it with a Unix socket at `/run/clamav/clamd.ctl`, which this app can use directly.
 
 Initial ClamAV setup:
 
@@ -226,6 +227,16 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install --upgrade pip
 pip install -e .
+
+# Ansible (recent core) + collections used by the playbooks
+pip install "ansible>=10"
+ansible-galaxy collection install --force community.general
+
+# Make venv ansible binaries the default on PATH so the worker's
+# subprocess.run("ansible-playbook", ...) finds the new version.
+ln -sf /opt/briehost-api/.venv/bin/ansible          /usr/local/bin/ansible
+ln -sf /opt/briehost-api/.venv/bin/ansible-playbook /usr/local/bin/ansible-playbook
+ln -sf /opt/briehost-api/.venv/bin/ansible-galaxy   /usr/local/bin/ansible-galaxy
 ```
 
 ## 5) Apply Supabase schema

@@ -119,6 +119,8 @@ curl -sI "$SUPABASE_URL/rest/v1/sites?select=id&limit=1" \
 3. **Stuck at `provisioning` → `failed`** with "Could not resolve hostname" or SSH timeout — inventory `ansible_host` wrong, or the `from="<api-ct-ip>"` lock in the Proxmox host's `authorized_keys` doesn't match the API CT's actual IP.
 4. **`live` but the dashboard shows nothing** — DHCP lease never landed; OPNsense pool exhausted or `tenant_bridge` wrong in `infra/ansible/inventory/group_vars/proxmox.yml`.
 5. **`scan_failed: zip policy: Path traversal blocked`** on a legitimate zip — the customer zipped from the wrong directory and embedded an absolute path. Re-zip from inside the project root.
+6. **`failed: ansible rc=4: [WARNING]: Collection community.general does not support Ansible version`** — Debian's `apt install ansible` is too old. Install ansible in the venv (`pip install "ansible>=10"`) and symlink the binaries into `/usr/local/bin` (see `PROXMOX_LXC_SETUP.md` § 4). Verify with `ansible --version` (need core ≥ 2.17).
+7. **`failed: ansible rc=1: ERROR! the role 'X' was not found`** — `ansible.cfg` at the repo root not being picked up. The worker's `WorkingDirectory` must be the repo root (default `/opt/briehost-api`); confirm with `systemctl show -p WorkingDirectory briehost-api`.
 
 ## Per-task ansible visibility (recommended)
 
