@@ -33,6 +33,30 @@ ARA_DATABASE_NAME=/opt/briehost-api/ara.sqlite
 
 `systemctl restart briehost-api` and trigger one upload to confirm a row lands in `ara.sqlite`.
 
+## Two CLIs, don't confuse them
+
+ARA ships **two** entry points:
+
+- **`ara-manage`** — Django management. Use it for DB setup and the web server: `ara-manage migrate`, `ara-manage runserver`, `ara-manage settings`.
+- **`ara`** — records-query CLI. Use it to inspect captured runs: `ara playbook list`, `ara task show <id>`, `ara result show <id>`.
+
+Both honor the same `ARA_*` env vars, so `set -a; . /opt/briehost-api/.env; set +a` before invoking them from a shell.
+
+Common queries:
+
+```bash
+ara playbook list                              # recent runs
+ara playbook list --status failed --limit 10
+ara playbook show <id>                         # one run with its plays
+ara task list --playbook <id> --order=-duration
+ara task list --status failed
+ara task show <id>
+ara result show <id>                           # actual stdout/stderr
+ara playbook prune --days 30                   # cleanup
+```
+
+Add `-f json` / `-f yaml` to pipe into `jq` etc.
+
 ## Run the web UI
 
 ```bash
