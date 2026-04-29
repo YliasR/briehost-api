@@ -27,6 +27,7 @@
     pool: "{{ tenant_pool }}"
     hostname: "{{ tenant_hostname }}"
     timeout: 300
+  delegate_to: localhost
   register: clone_result
 
 - name: Configure tenant CT resources + network (DHCP via OPNsense)
@@ -47,6 +48,7 @@
       net0: "name=eth0,bridge={{ tenant_bridge }},ip=dhcp,firewall=1"
     # Tag for ops visibility — e.g. `pct list` filtering, Proxmox UI search.
     description: "briehost site_id={{ site_id }} user_id={{ user_id }}"
+  delegate_to: localhost
 
 - name: Grow root disk to {{ tenant_disk_gb }}G (no-op if template is already that size)
   ansible.builtin.command: pct resize {{ new_vmid }} rootfs {{ tenant_disk_gb }}G

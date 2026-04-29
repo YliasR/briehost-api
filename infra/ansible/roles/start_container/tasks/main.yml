@@ -13,6 +13,7 @@
     vmid: "{{ new_vmid }}"
     state: started
     timeout: 120
+  delegate_to: localhost
 
 - name: Wait until pct exec works inside the tenant CT
   ansible.builtin.command: pct exec {{ new_vmid }} -- /bin/true
