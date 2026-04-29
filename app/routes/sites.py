@@ -47,6 +47,12 @@ async def upload_site(
     except HTTPException:
         target.unlink(missing_ok=True)
         raise
+    except Exception as exc:
+        target.unlink(missing_ok=True)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Failed to store uploaded file",
+        ) from exc
 
     admin_client().table("sites").insert(
         {

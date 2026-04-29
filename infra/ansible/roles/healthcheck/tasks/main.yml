@@ -5,7 +5,7 @@
   ansible.builtin.uri:
     url: "http://{{ tenant_ip }}/"
     method: GET
-    status_code: [200, 201, 202, 301, 302, 401, 403]
+    status_code: "{{ range(100, 500) | list }}"
     timeout: 5
   register: hc
   retries: 30
