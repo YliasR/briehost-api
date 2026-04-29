@@ -37,6 +37,7 @@ class Settings:
 
     # Malware / zip policy
     enable_malware_scan: bool = _bool("ENABLE_MALWARE_SCAN", "true")
+    clamd_socket: str = os.getenv("CLAMD_SOCKET", "/run/clamav/clamd.ctl")
     clamd_host: str = os.getenv("CLAMD_HOST", "127.0.0.1")
     clamd_port: int = int(os.getenv("CLAMD_PORT", "3310") or 3310)
     max_zip_files: int = int(os.getenv("MAX_ZIP_FILES", "5000") or 5000)

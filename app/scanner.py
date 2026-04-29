@@ -1,4 +1,4 @@
-"""Malware scanning for uploaded zips. Uses clamd over TCP."""
+"""Malware scanning for uploaded zips. Uses clamd over a Unix socket or TCP."""
 import socket
 from pathlib import Path
 
@@ -21,7 +21,31 @@ def _recv_all(sock: socket.socket) -> bytes:
     return b"".join(chunks)
 
 
-def clamd_scan(zip_path: Path, host: str, port: int, timeout: float = 60.0) -> None:
+def _stream_scan(sock: socket.socket, zip_path: Path) -> str:
+    sock.sendall(b"zINSTREAM\0")
+    with zip_path.open("rb") as f:
+        while True:
+            chunk = f.read(64 * 1024)
+            if not chunk:
+                break
+            sock.sendall(len(chunk).to_bytes(4, "big") + chunk)
+    sock.sendall((0).to_bytes(4, "big"))
+    return _recv_all(sock).decode("utf-8", errors="replace").strip("\x00 \r\n")
+
+
+def _scan_via_unix_socket(zip_path: Path, socket_path: str, timeout: float) -> str:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        sock.connect(socket_path)
+        return _stream_scan(sock, zip_path)
+
+
+def _scan_via_tcp(zip_path: Path, host: str, port: int, timeout: float) -> str:
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        return _stream_scan(sock, zip_path)
+
+
+def clamd_scan(zip_path: Path, host: str, port: int, socket_path: str | None = None, timeout: float = 60.0) -> None:
     """
     Stream `zip_path` to clamd via INSTREAM and raise on detection.
 
@@ -29,18 +53,17 @@ def clamd_scan(zip_path: Path, host: str, port: int, timeout: float = 60.0) -> N
     followed by the bytes, terminated by a zero-length chunk.
     """
     try:
-        with socket.create_connection((host, port), timeout=timeout) as sock:
-            sock.sendall(b"zINSTREAM\0")
-            with zip_path.open("rb") as f:
-                while True:
-                    chunk = f.read(64 * 1024)
-                    if not chunk:
-                        break
-                    sock.sendall(len(chunk).to_bytes(4, "big") + chunk)
-            sock.sendall((0).to_bytes(4, "big"))
-            response = _recv_all(sock).decode("utf-8", errors="replace").strip("\x00 \r\n")
+        if socket_path:
+            socket_file = Path(socket_path)
+            if socket_file.exists():
+                response = _scan_via_unix_socket(zip_path, socket_path, timeout)
+            else:
+                response = _scan_via_tcp(zip_path, host, port, timeout)
+        else:
+            response = _scan_via_tcp(zip_path, host, port, timeout)
     except OSError as exc:
-        raise ScanError(f"clamd unreachable at {host}:{port}: {exc}") from exc
+        target = socket_path if socket_path else f"{host}:{port}"
+        raise ScanError(f"clamd unreachable at {target}: {exc}") from exc
 
     # Responses: "stream: OK" or "stream: <SIG> FOUND" or "... ERROR"
     if response.endswith("OK"):

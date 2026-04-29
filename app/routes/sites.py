@@ -51,6 +51,9 @@ async def upload_site(
         }
     ).execute()
 
+    # NOTE: provisioning currently runs in-process via FastAPI BackgroundTasks.
+    # Long-running scans + ansible-playbook can saturate the worker pool under
+    # concurrent uploads; move enqueue_provision to Celery/RQ/Arq before scaling.
     enqueue_provision(background_tasks, settings, site_id, user_id, target)
 
     return {"siteId": site_id, "status": "uploaded"}

@@ -34,7 +34,13 @@ def validate_zip_policy(
     max_uncompressed_bytes: int,
     max_compression_ratio: int,
 ) -> None:
-    """Reject zip bombs / oversized archives before extraction."""
+    """
+    Reject zip bombs, oversized archives, symlinks, and path-traversal members.
+
+    This is the gate before the zip is handed to ansible/`pct push` for unzip
+    inside the tenant CT — that unzip itself doesn't enforce safe extraction,
+    so all member-level checks must happen here.
+    """
     with zipfile.ZipFile(zip_path) as zf:
         infos = zf.infolist()
         if len(infos) > max_files:
@@ -43,6 +49,18 @@ def validate_zip_policy(
         total_uncompressed = 0
         total_compressed = 0
         for member in infos:
+            if (member.external_attr >> 16) & 0o170000 == 0o120000:
+                raise UnsafeZipError(f"Symlink not allowed: {member.filename}")
+
+            normalized = os.path.normpath(member.filename).replace("\\", "/")
+            if (
+                os.path.isabs(member.filename)
+                or normalized.startswith("../")
+                or normalized == ".."
+                or "/../" in normalized
+            ):
+                raise UnsafeZipError(f"Path traversal blocked: {member.filename}")
+
             total_uncompressed += member.file_size
             total_compressed += member.compress_size
             if total_uncompressed > max_uncompressed_bytes:

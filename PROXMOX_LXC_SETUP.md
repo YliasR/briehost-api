@@ -162,7 +162,7 @@ apt install -y python3 python3-venv python3-pip curl git \
                clamav clamav-daemon
 ```
 
-`ansible` runs the provisioning playbooks. `clamav-daemon` provides `clamd`, used by the upload scanner, but Debian often starts it with only a Unix socket. If you want the app to reach it over `CLAMD_HOST` / `CLAMD_PORT`, enable TCP in `clamd.conf`.
+`ansible` runs the provisioning playbooks. `clamav-daemon` provides `clamd`, used by the upload scanner. Debian commonly starts it with a Unix socket at `/run/clamav/clamd.ctl`, which this app can use directly.
 
 Initial ClamAV setup:
 
@@ -171,11 +171,11 @@ systemctl stop clamav-freshclam
 freshclam                       # one-shot signature pull
 systemctl enable --now clamav-freshclam   # background updates
 systemctl enable --now clamav-daemon
-ss -lxnp | grep clamd           # clamd may only show a Unix socket at first
-grep -E '^(TCPSocket|TCPAddr)' /etc/clamav/clamd.conf
+ss -lxnp | grep clamd           # confirm the Unix socket is present
+ls -l /run/clamav/clamd.ctl
 ```
 
-If `clamd` is bound to a unix socket only by default, edit `/etc/clamav/clamd.conf` to enable TCP. After that, `ss -ltnp | grep 3310` should show the listener:
+If you prefer TCP instead, keep the existing `TCPSocket 3310` / `TCPAddr 127.0.0.1` settings and set `CLAMD_SOCKET=` empty in the API env to force TCP.
 
 ```conf
 TCPSocket 3310

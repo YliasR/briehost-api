@@ -18,7 +18,7 @@
     site_name: "{{ site_name | default(site_id) }}"
 
   pre_tasks:
-    - name: Validate required variables
+    - name: Validate required extra-vars + Proxmox API credentials
       ansible.builtin.assert:
         that:
           - site_id is defined and site_id | length > 0
@@ -26,7 +26,25 @@
           - zip_path is defined and zip_path | length > 0
           - target_node is defined and target_node | length > 0
           - template_vmid is defined and (template_vmid | int) > 0
-        fail_msg: "Missing or invalid extra-vars for provisioning"
+          - proxmox_api_host is defined and proxmox_api_host | length > 0
+          - proxmox_api_user is defined and proxmox_api_user | length > 0
+          - proxmox_api_token_id is defined and proxmox_api_token_id | length > 0
+          - proxmox_api_token_secret is defined and proxmox_api_token_secret | length > 0
+        fail_msg: "Missing or invalid provisioning inputs or Proxmox API credentials"
+
+    - name: Verify zip exists on the controller
+      ansible.builtin.stat:
+        path: "{{ zip_path }}"
+      delegate_to: localhost
+      become: false
+      register: zip_path_stat
+
+    - name: Reject missing/non-regular zip paths
+      ansible.builtin.assert:
+        that:
+          - zip_path_stat.stat.exists
+          - zip_path_stat.stat.isreg
+        fail_msg: "zip_path missing or not a regular file on the controller: {{ zip_path }}"
 
   roles:
     - proxmox_cleanup

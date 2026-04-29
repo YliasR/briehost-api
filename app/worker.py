@@ -10,6 +10,7 @@ import json
 import logging
 import shlex
 import subprocess
+import zipfile
 from pathlib import Path
 
 from app.config import Settings
@@ -36,6 +37,14 @@ def _set_status(site_id: str, status: str, error: str | None = None) -> None:
         payload["error_message"] = error[:_TRIM]
         log.warning("site_id=%s status=%s error=%s", site_id, status, error[:_TRIM])
     admin_client().table("sites").update(payload).eq("id", site_id).execute()
+
+
+def _set_status_safe(site_id: str, status: str, error: str | None = None) -> None:
+    """Best-effort status write for the last-resort handler — never raises."""
+    try:
+        _set_status(site_id, status, error)
+    except Exception:
+        log.exception("could not persist final status for site_id=%s", site_id)
 
 
 def _run_ansible(settings: Settings, site_id: str, user_id: str, zip_path: Path) -> tuple[int, str, str]:
@@ -79,10 +88,21 @@ def provision_site(settings: Settings, site_id: str, user_id: str, zip_path: Pat
         except UnsafeZipError as exc:
             _set_status(site_id, STATUS_SCAN_FAILED, f"zip policy: {exc}")
             return
+        except zipfile.BadZipFile as exc:
+            _set_status(site_id, STATUS_SCAN_FAILED, f"corrupt zip: {exc}")
+            return
+        except OSError as exc:
+            _set_status(site_id, STATUS_SCAN_FAILED, f"zip read failed: {exc}")
+            return
 
         if settings.enable_malware_scan:
             try:
-                clamd_scan(zip_path, settings.clamd_host, settings.clamd_port)
+                clamd_scan(
+                    zip_path,
+                    settings.clamd_host,
+                    settings.clamd_port,
+                    settings.clamd_socket,
+                )
             except MalwareDetected as exc:
                 _set_status(site_id, STATUS_SCAN_FAILED, f"malware: {exc}")
                 return
@@ -101,7 +121,7 @@ def provision_site(settings: Settings, site_id: str, user_id: str, zip_path: Pat
             _set_status(site_id, STATUS_FAILED, f"ansible rc={rc}: {tail}")
     except Exception as exc:  # noqa: BLE001 — last-resort guard so worker never crashes silently
         log.exception("provisioning crashed for site_id=%s", site_id)
-        _set_status(site_id, STATUS_FAILED, f"worker crash: {exc}")
+        _set_status_safe(site_id, STATUS_FAILED, f"worker crash: {exc}")
 
 
 def enqueue_provision(

@@ -52,9 +52,11 @@
 
 - name: Grow root disk to {{ tenant_disk_gb }}G (no-op if template is already that size)
   ansible.builtin.command: pct resize {{ new_vmid }} rootfs {{ tenant_disk_gb }}G
-  changed_when: "'unable to shrink' not in resize_out.stderr | default('')"
+  register: resize_out
+  changed_when:
+    - "'already' not in resize_out.stderr | default('')"
+    - "'unable to shrink' not in resize_out.stderr | default('')"
   failed_when:
     - resize_out.rc != 0
     - "'already' not in resize_out.stderr | default('')"
     - "'unable to shrink' not in resize_out.stderr | default('')"
-  register: resize_out
