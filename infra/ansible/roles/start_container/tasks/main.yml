@@ -8,6 +8,7 @@
     api_user: "{{ proxmox_api_user }}"
     api_token_id: "{{ proxmox_api_token_id }}"
     api_token_secret: "{{ proxmox_api_token_secret }}"
+    validate_certs: false
     node: "{{ target_node }}"
     vmid: "{{ new_vmid }}"
     state: started
