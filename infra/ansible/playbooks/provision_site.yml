@@ -1,0 +1,54 @@
+---
+# Provision a PHP site into a fresh Proxmox LXC clone and start it.
+#
+# Required extra vars (passed by app/worker.py):
+#   site_id        UUID of the site row in Supabase
+#   user_id        UUID of the owning user
+#   zip_path       Absolute path on the API host to the validated zip
+#   target_node    Proxmox node name (e.g. "pve")
+#   template_vmid  VMID of the PHP LXC template to clone
+#
+# Optional:
+#   site_name      Human-readable display name (logging only)
+
+- name: Provision PHP site
+  hosts: proxmox
+  gather_facts: false
+  vars:
+    site_name: "{{ site_name | default(site_id) }}"
+
+  pre_tasks:
+    - name: Validate required extra-vars + Proxmox API credentials
+      ansible.builtin.assert:
+        that:
+          - site_id is defined and site_id | length > 0
+          - user_id is defined and user_id | length > 0
+          - zip_path is defined and zip_path | length > 0
+          - target_node is defined and target_node | length > 0
+          - template_vmid is defined and (template_vmid | int) > 0
+          - proxmox_api_host is defined and proxmox_api_host | length > 0
+          - proxmox_api_user is defined and proxmox_api_user | length > 0
+          - proxmox_api_token_id is defined and proxmox_api_token_id | length > 0
+          - proxmox_api_token_secret is defined and proxmox_api_token_secret | length > 0
+        fail_msg: "Missing or invalid provisioning inputs or Proxmox API credentials"
+
+    - name: Verify zip exists on the controller
+      ansible.builtin.stat:
+        path: "{{ zip_path }}"
+      delegate_to: localhost
+      become: false
+      register: zip_path_stat
+
+    - name: Reject missing/non-regular zip paths
+      ansible.builtin.assert:
+        that:
+          - zip_path_stat.stat.exists
+          - zip_path_stat.stat.isreg
+        fail_msg: "zip_path missing or not a regular file on the controller: {{ zip_path }}"
+
+  roles:
+    - proxmox_cleanup
+    - proxmox_clone
+    - start_container
+    - deploy_site_zip
+    - healthcheck

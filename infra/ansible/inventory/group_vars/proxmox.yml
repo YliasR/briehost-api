@@ -1,0 +1,23 @@
+---
+# Proxmox API credentials — sourced from environment so secrets stay out of git.
+# These env vars must be set in the systemd unit running ansible-playbook
+# (the briehost-api .env is loaded via EnvironmentFile=).
+
+proxmox_api_host: "{{ lookup('env', 'PROXMOX_HOST') }}"
+proxmox_api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
+proxmox_api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
+proxmox_api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+
+# Tenant defaults — override per-environment if needed.
+tenant_pool: briehost
+tenant_bridge: vmbr1            # bridge that sits behind the OPNsense LAN
+tenant_disk_storage: local-lvm  # thin-provisioned by default on local-lvm
+tenant_disk_gb: 8
+tenant_cores: 1
+tenant_memory_mb: 512
+tenant_swap_mb: 256
+tenant_nameserver: ""           # empty -> inherit from host / DHCP
+
+# Convenience: short ID used in hostnames (first 8 chars of site_id UUID).
+short_id: "{{ site_id.split('-')[0] }}"
+tenant_hostname: "site-{{ short_id }}"

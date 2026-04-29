@@ -83,6 +83,7 @@ Yes, this can and should be implemented.
 1. **ClamAV scan (required baseline)**
    - Scan the uploaded zip before extraction/provisioning.
    - Prefer daemon mode (`clamd`) for performance.
+   - Default to the Unix socket at `/run/clamav/clamd.ctl` via `CLAMD_SOCKET`; if you prefer TCP, keep `CLAMD_HOST` / `CLAMD_PORT` and configure `clamd` with `TCPSocket 3310` and `TCPAddr 127.0.0.1`.
 2. **Zip policy checks (already partly present)**
    - Keep traversal/symlink protections (`app/storage.py`).
    - Add limits for:

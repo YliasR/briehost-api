@@ -1,0 +1,39 @@
+---
+# Start the tenant CT and wait for it to be reachable via `pct exec`.
+# Runs before deploy_site_zip so we can `pct push` into a live container.
+
+- name: Start tenant CT
+  community.general.proxmox:
+    api_host: "{{ proxmox_api_host }}"
+    api_user: "{{ proxmox_api_user }}"
+    api_token_id: "{{ proxmox_api_token_id }}"
+    api_token_secret: "{{ proxmox_api_token_secret }}"
+    node: "{{ target_node }}"
+    vmid: "{{ new_vmid }}"
+    state: started
+    timeout: 120
+
+- name: Wait until pct exec works inside the tenant CT
+  ansible.builtin.command: pct exec {{ new_vmid }} -- /bin/true
+  register: pct_ready
+  retries: 30
+  delay: 2
+  until: pct_ready.rc == 0
+  changed_when: false
+
+- name: Wait until tenant CT has a DHCP lease on eth0
+  ansible.builtin.shell: |
+    set -o pipefail
+    pct exec {{ new_vmid }} -- ip -4 -o addr show dev eth0 \
+      | awk '{print $4}' | cut -d/ -f1 | head -n1
+  args:
+    executable: /bin/bash
+  register: tenant_ip_lookup
+  retries: 30
+  delay: 2
+  until: tenant_ip_lookup.stdout | length > 0
+  changed_when: false
+
+- name: Record tenant IP
+  ansible.builtin.set_fact:
+    tenant_ip: "{{ tenant_ip_lookup.stdout | trim }}"

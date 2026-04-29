@@ -1,0 +1,19 @@
+---
+# Verify the tenant CT serves HTTP on its DHCP-assigned IP before reporting success.
+
+- name: HTTP healthcheck against tenant IP
+  ansible.builtin.uri:
+    url: "http://{{ tenant_ip }}/"
+    method: GET
+    status_code: "{{ range(100, 500) | list }}"
+    timeout: 5
+  register: hc
+  retries: 30
+  delay: 2
+  until: hc.status is defined and hc.status < 500
+
+- name: Provisioning summary
+  ansible.builtin.debug:
+    msg: >
+      site_id={{ site_id }} vmid={{ new_vmid }} ip={{ tenant_ip }}
+      hostname={{ tenant_hostname }} status=live

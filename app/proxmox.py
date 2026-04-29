@@ -1,20 +1,14 @@
-"""Proxmox LXC provisioning. Currently a stub — the team fills in the real calls."""
+"""Deprecated: provisioning now runs via Ansible (see app/worker.py and infra/ansible/).
+
+Kept as a thin marker so older imports fail loudly instead of silently doing nothing.
+"""
 from pathlib import Path
+from typing import NoReturn
 
 from app.config import Settings
 
 
-def provision_php_site(settings: Settings, site_id: str, extracted_dir: Path) -> int:
-    """
-    Clone the PHP LXC template, push `extracted_dir` into /var/www/html, start the container.
-
-    Returns the new container's VMID.
-
-    TODO (team):
-      - Use `proxmoxer.ProxmoxAPI(...)` with API-token auth (settings.proxmox_token_id / _secret).
-      - `nodes/<node>/lxc/<template>/clone` to clone settings.php_template_vmid.
-      - Wait for clone to finish (poll task status).
-      - Push files: tarball + `pct push` or rsync over the bridged network.
-      - `pct start <new_vmid>`.
-    """
-    raise NotImplementedError("Proxmox provisioning not yet wired up")
+def provision_php_site(settings: Settings, site_id: str, extracted_dir: Path) -> NoReturn:
+    raise RuntimeError(
+        "provision_php_site() is deprecated; provisioning is handled by app.worker via Ansible"
+    )
