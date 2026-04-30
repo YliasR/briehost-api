@@ -16,8 +16,12 @@
     /tmp/site.zip
   changed_when: true
 
+- name: Ensure in-CT deploy script is executable
+  ansible.builtin.command: pct exec {{ new_vmid }} -- chmod +x /usr/local/bin/deploy-site.sh
+  changed_when: false
+
 - name: Run in-CT deploy script (wipes docroot, unzips, fixes perms)
-  ansible.builtin.command: pct exec {{ new_vmid }} -- /usr/local/bin/deploy-site.sh /tmp/site.zip
+  ansible.builtin.command: pct exec {{ new_vmid }} -- bash /usr/local/bin/deploy-site.sh /tmp/site.zip
   changed_when: true
 
 - name: Reload php-fpm so opcache picks up new files
