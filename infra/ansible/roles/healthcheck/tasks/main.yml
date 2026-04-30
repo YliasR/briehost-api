@@ -8,9 +8,9 @@
     status_code: "{{ range(100, 500) | list }}"
     timeout: 5
   register: hc
-  retries: 30
-  delay: 2
-  until: hc.status is defined and hc.status < 500
+  retries: 60
+  delay: 3
+  until: hc.status is defined and hc.status > 0 and hc.status < 500
 
 - name: Provisioning summary (parsed by worker)
   ansible.builtin.debug:
