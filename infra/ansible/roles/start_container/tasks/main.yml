@@ -40,6 +40,20 @@
   ansible.builtin.set_fact:
     tenant_ip: "{{ tenant_ip_lookup.stdout | trim }}"
 
+- name: Update CT description with the assigned IP (visible in Proxmox UI)
+  community.proxmox.proxmox:
+    api_host: "{{ proxmox_api_host }}"
+    api_user: "{{ proxmox_api_user }}"
+    api_token_id: "{{ proxmox_api_token_id }}"
+    api_token_secret: "{{ proxmox_api_token_secret }}"
+    validate_certs: false
+    node: "{{ target_node }}"
+    vmid: "{{ new_vmid }}"
+    hostname: "{{ tenant_hostname }}"
+    update: true
+    description: "briehost site={{ tenant_hostname }} ip={{ tenant_ip }} site_id={{ site_id }} user_id={{ user_id }}"
+  delegate_to: localhost
+
 # Send something outbound so OPNsense / the bridge learn the CT's MAC<->IP
 # mapping before the healthcheck fires. Without this, the first inbound
 # SYN from off-host can be silently dropped while ARP resolves. ICMP may be

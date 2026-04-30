@@ -48,7 +48,8 @@
     netif:
       net0: "name=eth0,bridge={{ tenant_bridge }},ip=dhcp,firewall=0"
     # Tag for ops visibility — e.g. `pct list` filtering, Proxmox UI search.
-    description: "briehost site_id={{ site_id }} user_id={{ user_id }}"
+    # IP is appended in start_container once DHCP hands one out.
+    description: "briehost site={{ tenant_hostname }} site_id={{ site_id }} user_id={{ user_id }}"
   delegate_to: localhost
 
 - name: Grow root disk to {{ tenant_disk_gb }}G (no-op if template is already that size)
