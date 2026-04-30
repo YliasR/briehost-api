@@ -12,8 +12,6 @@
   delay: 2
   until: hc.status is defined and hc.status < 500
 
-- name: Provisioning summary
+- name: Provisioning summary (parsed by worker)
   ansible.builtin.debug:
-    msg: >
-      site_id={{ site_id }} vmid={{ new_vmid }} ip={{ tenant_ip }}
-      hostname={{ tenant_hostname }} status=live
+    msg: "BRIEHOST_RESULT site_id={{ site_id }} vmid={{ new_vmid }} ip={{ tenant_ip }} hostname={{ tenant_hostname }} status=live"

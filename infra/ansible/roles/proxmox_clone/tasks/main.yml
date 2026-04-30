@@ -46,7 +46,7 @@
     swap: "{{ tenant_swap_mb }}"
     onboot: true
     netif:
-      net0: "name=eth0,bridge={{ tenant_bridge }},ip=dhcp,firewall=1"
+      net0: "name=eth0,bridge={{ tenant_bridge }},ip=dhcp,firewall=0"
     # Tag for ops visibility — e.g. `pct list` filtering, Proxmox UI search.
     description: "briehost site_id={{ site_id }} user_id={{ user_id }}"
   delegate_to: localhost

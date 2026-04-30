@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shlex
 import subprocess
 import threading
@@ -57,11 +58,30 @@ def _inflight_dec() -> None:
         _inflight = max(0, _inflight - 1)
 
 
-def _set_status(site_id: str, status: str, error: str | None = None) -> None:
+# Healthcheck role emits: "BRIEHOST_RESULT site_id=... vmid=... ip=... hostname=... status=live"
+_RESULT_RE = re.compile(r"BRIEHOST_RESULT\s+(?P<kv>[^\"]+?)(?:\\n|\"|$)")
+_KV_RE = re.compile(r"(\w+)=([^\s\"]+)")
+
+
+def _parse_ansible_result(stdout: str) -> dict[str, str]:
+    match = _RESULT_RE.search(stdout)
+    if not match:
+        return {}
+    return dict(_KV_RE.findall(match.group("kv")))
+
+
+def _set_status(
+    site_id: str,
+    status: str,
+    error: str | None = None,
+    extra: dict[str, object] | None = None,
+) -> None:
     payload: dict[str, object] = {"status": status}
     if error is not None:
         payload["error_message"] = error[:_TRIM]
         log.warning("site_id=%s status=%s error=%s", site_id, status, error[:_TRIM])
+    if extra:
+        payload.update(extra)
     admin_client().table("sites").update(payload).eq("id", site_id).execute()
 
 
@@ -170,7 +190,16 @@ def provision_site(settings: Settings, site_id: str, user_id: str, zip_path: Pat
             return
 
         if rc == 0:
-            _set_status(site_id, STATUS_LIVE)
+            parsed = _parse_ansible_result(stdout)
+            extra: dict[str, object] = {}
+            if ip := parsed.get("ip"):
+                extra["ip_address"] = ip
+            if vmid := parsed.get("vmid"):
+                try:
+                    extra["vmid"] = int(vmid)
+                except ValueError:
+                    pass
+            _set_status(site_id, STATUS_LIVE, extra=extra or None)
         else:
             tail = (stderr or stdout)[-_TRIM:]
             _set_status(site_id, STATUS_FAILED, f"ansible rc={rc}: {tail}")
