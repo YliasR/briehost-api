@@ -9,6 +9,12 @@
     dest: "/tmp/briehost-{{ site_id }}.zip"
     mode: "0600"
 
+- name: Stage canonical deploy script on Proxmox host
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../templates/deploy-site.sh"
+    dest: "/tmp/briehost-deploy-site.sh"
+    mode: "0755"
+
 - name: Push staged zip into tenant CT
   ansible.builtin.command: >
     pct push {{ new_vmid }}
@@ -16,9 +22,13 @@
     /tmp/site.zip
   changed_when: true
 
-- name: Ensure in-CT deploy script is executable
-  ansible.builtin.command: pct exec {{ new_vmid }} -- chmod +x /usr/local/bin/deploy-site.sh
-  changed_when: false
+- name: Push canonical deploy script into tenant CT (overwrites template's copy)
+  ansible.builtin.command: >
+    pct push {{ new_vmid }}
+    /tmp/briehost-deploy-site.sh
+    /usr/local/bin/deploy-site.sh
+    --perms 0755
+  changed_when: true
 
 - name: Run in-CT deploy script (wipes docroot, unzips, fixes perms)
   ansible.builtin.command: pct exec {{ new_vmid }} -- bash /usr/local/bin/deploy-site.sh /tmp/site.zip
@@ -29,10 +39,13 @@
   changed_when: true
   failed_when: false   # service name varies (php8.2-fpm etc); reload is best-effort
 
-- name: Clean up staged zip on host
+- name: Clean up staged files on host
   ansible.builtin.file:
-    path: "/tmp/briehost-{{ site_id }}.zip"
+    path: "{{ item }}"
     state: absent
+  loop:
+    - "/tmp/briehost-{{ site_id }}.zip"
+    - "/tmp/briehost-deploy-site.sh"
 
 - name: Clean up zip inside tenant CT
   ansible.builtin.command: pct exec {{ new_vmid }} -- rm -f /tmp/site.zip
