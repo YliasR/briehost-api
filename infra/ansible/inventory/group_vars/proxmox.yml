@@ -20,4 +20,6 @@ tenant_nameserver: ""           # empty -> inherit from host / DHCP
 
 # Convenience: short ID used in hostnames (first 8 chars of site_id UUID).
 short_id: "{{ site_id.split('-')[0] }}"
-tenant_hostname: "site-{{ short_id }}"
+# `site_slug` comes from the worker (derived from the upload filename); fall back to "site"
+# so manual ansible-playbook invocations without -e site_slug=... still work.
+tenant_hostname: "{{ (site_slug | default('site')) }}-{{ short_id }}"

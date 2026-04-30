@@ -39,6 +39,7 @@
     validate_certs: false
     node: "{{ target_node }}"
     vmid: "{{ new_vmid }}"
+    hostname: "{{ tenant_hostname }}"
     update: true
     cores: "{{ tenant_cores }}"
     memory: "{{ tenant_memory_mb }}"

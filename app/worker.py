@@ -76,9 +76,12 @@ def _set_status_safe(site_id: str, status: str, error: str | None = None) -> Non
 def _run_ansible(
     settings: Settings, site_id: str, user_id: str, zip_path: Path
 ) -> tuple[int, str, str]:
+    # Filename is `<slug>-<site_id>.zip`; recover the slug for human-readable hostnames.
+    site_slug = zip_path.stem.removesuffix(f"-{site_id}") or "site"
     extra_vars: dict[str, object] = {
         "site_id": site_id,
         "user_id": user_id,
+        "site_slug": site_slug,
         "zip_path": str(zip_path),
         "target_node": settings.proxmox_node,
         "template_vmid": settings.php_template_vmid,
