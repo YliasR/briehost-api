@@ -71,9 +71,10 @@ def register_route(settings: Settings, subdomain: str, ip: str) -> None:
         if resp.status_code not in (200, 404):
             resp.raise_for_status()
 
-        # Prepend at index 0 so dynamic per-site routes match before the
-        # static catchall route in the Caddyfile.
-        resp = client.post(f"{base}{_ROUTES_PATH}/0", json=body)
+        # PUT inserts before the given index and shifts existing elements down,
+        # which puts the new route ahead of the Caddyfile catchall at index 0.
+        # POST on an array index path appends instead — wrong for our ordering.
+        resp = client.put(f"{base}{_ROUTES_PATH}/0", json=body)
         resp.raise_for_status()
 
 
@@ -126,7 +127,7 @@ def replace_all_routes(settings: Settings, sites: list[tuple[str, str]]) -> int:
             if not (sub and ip):
                 continue
             body = _build_route(sub, ip, settings.gateway_domain)
-            r = client.post(f"{base}{_ROUTES_PATH}/0", json=body)
+            r = client.put(f"{base}{_ROUTES_PATH}/0", json=body)
             r.raise_for_status()
             pushed += 1
 
