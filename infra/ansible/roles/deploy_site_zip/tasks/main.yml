@@ -34,11 +34,6 @@
   ansible.builtin.command: pct exec {{ new_vmid }} -- bash /usr/local/bin/deploy-site.sh /tmp/site.zip
   changed_when: true
 
-- name: Reload php-fpm so opcache picks up new files
-  ansible.builtin.command: pct exec {{ new_vmid }} -- systemctl reload php-fpm
-  changed_when: true
-  failed_when: false   # service name varies (php8.2-fpm etc); reload is best-effort
-
 - name: Clean up staged files on host
   ansible.builtin.file:
     path: "{{ item }}"

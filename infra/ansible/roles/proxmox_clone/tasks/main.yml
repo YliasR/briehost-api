@@ -29,6 +29,20 @@
     timeout: 300
   delegate_to: localhost
   register: clone_result
+  # Retry on transient lock/race errors from Proxmox. The worker already
+  # serializes its own clones via a process-wide mutex, but a human poking
+  # the Proxmox UI can still create contention. Match on common phrases
+  # rather than HTTP codes — community.proxmox bubbles those up in `msg`.
+  retries: 5
+  delay: 6
+  until: >-
+    clone_result is succeeded or
+    not (
+      (clone_result.msg | default('') | regex_search('lock timeout', ignorecase=True)) or
+      (clone_result.msg | default('') | regex_search('already locked', ignorecase=True)) or
+      (clone_result.msg | default('') | regex_search('CT \\d+ already exists', ignorecase=True)) or
+      (clone_result.msg | default('') | regex_search('VM \\d+ already exists', ignorecase=True))
+    )
 
 - name: Configure tenant CT resources + network (DHCP via OPNsense)
   community.proxmox.proxmox:

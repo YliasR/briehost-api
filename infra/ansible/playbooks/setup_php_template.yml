@@ -1,0 +1,82 @@
+---
+# One-shot playbook to harden the PHP LXC template for Laravel-style apps.
+# Adds composer + missing PHP extensions + enables mod_rewrite. Every CT
+# cloned from the template afterwards inherits the changes.
+#
+# Run with:
+#   ansible-playbook -i inventory/production.ini playbooks/setup_php_template.yml \
+#     -e template_vmid=<VMID>
+#
+# The template CT must be reachable via `pct exec` on the Proxmox host.
+# If it's stopped, this playbook will start it and leave it running — stop
+# it manually after a successful run if you want it back to a cold template.
+
+- name: Harden PHP LXC template for Laravel + static PHP
+  hosts: proxmox
+  gather_facts: false
+
+  pre_tasks:
+    - name: Validate template_vmid
+      ansible.builtin.assert:
+        that:
+          - template_vmid is defined
+          - (template_vmid | int) > 0
+        fail_msg: "Pass -e template_vmid=<VMID>"
+
+    - name: Check current power state
+      ansible.builtin.command: pct status {{ template_vmid }}
+      register: pct_status
+      changed_when: false
+
+    - name: Start the template CT if it isn't running
+      ansible.builtin.command: pct start {{ template_vmid }}
+      when: "'status: running' not in pct_status.stdout"
+      changed_when: true
+
+    - name: Wait a moment for systemd inside the CT to come up
+      ansible.builtin.pause:
+        seconds: 5
+      when: "'status: running' not in pct_status.stdout"
+
+  tasks:
+    - name: Refresh apt cache inside template
+      ansible.builtin.command: pct exec {{ template_vmid }} -- apt-get update -qq
+      changed_when: true
+
+    - name: Install composer + Laravel-required PHP extensions + unzip
+      # Template uses nginx + php-fpm; no apache modules to enable. mod_rewrite
+      # is an Apache concept — nginx replaces it with `try_files` directives,
+      # which we set per-site in the deploy script.
+      ansible.builtin.command: >-
+        pct exec {{ template_vmid }} --
+        apt-get install -y -qq
+        composer
+        php8.2-bcmath
+        php8.2-curl
+        php8.2-zip
+        unzip
+      register: apt_install
+      changed_when: "'newly installed' in apt_install.stdout or 'upgraded' in apt_install.stdout"
+
+    - name: Verify composer is on PATH
+      ansible.builtin.command: pct exec {{ template_vmid }} -- composer --version
+      register: composer_version
+      changed_when: false
+
+    - name: Verify required PHP modules are loaded
+      ansible.builtin.shell: |
+        pct exec {{ template_vmid }} -- php -m | grep -iE '^(bcmath|ctype|curl|fileinfo|mbstring|openssl|pdo|tokenizer|xml|zip)$' | sort -u
+      register: php_modules
+      changed_when: false
+
+    - name: Locate php-fpm socket (sanity check for the deploy script)
+      ansible.builtin.command: pct exec {{ template_vmid }} -- ls /run/php/
+      register: php_fpm_sock
+      changed_when: false
+
+    - name: Show what we ended up with
+      ansible.builtin.debug:
+        msg:
+          - "{{ composer_version.stdout_lines | first }}"
+          - "PHP modules present: {{ php_modules.stdout_lines | join(', ') }}"
+          - "php-fpm sockets: {{ php_fpm_sock.stdout_lines | join(', ') }}"

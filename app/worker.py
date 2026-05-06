@@ -41,6 +41,16 @@ _TRIM = 4000  # cap for stderr/stdout we persist
 _inflight_lock = threading.Lock()
 _inflight = 0
 
+# Serializes the ansible-playbook call across concurrent uploads. Proxmox
+# clone+config operations race on two fronts:
+#   1. `pvesh get /cluster/nextid` is informational, so two concurrent runs
+#      can get the same VMID and the second clone fails (403 or "exists").
+#   2. Full clones from the same LVM-thin template hit a storage-level lock
+#      and one of the parallel runs gets "got lock timeout" (HTTP 500).
+# Holding this lock means scan/validate still run in parallel; only the
+# Proxmox interaction serializes. This is the bottleneck anyway.
+_provision_lock = threading.Lock()
+
 
 def inflight_count() -> int:
     with _inflight_lock:
@@ -181,7 +191,8 @@ def provision_site(settings: Settings, site_id: str, user_id: str, zip_path: Pat
         _set_status(site_id, STATUS_PROVISIONING)
 
         try:
-            rc, stdout, stderr = _run_ansible(settings, site_id, user_id, zip_path)
+            with _provision_lock:
+                rc, stdout, stderr = _run_ansible(settings, site_id, user_id, zip_path)
         except subprocess.TimeoutExpired as exc:
             _set_status(
                 site_id,
