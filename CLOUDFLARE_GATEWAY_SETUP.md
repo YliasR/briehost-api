@@ -1,6 +1,6 @@
 # Public subdomains via Cloudflare Tunnel + Caddy gateway
 
-Each tenant site gets a public URL like `https://<slug>.brieblast.tld` without
+Each tenant site gets a public URL like `https://<slug>.briehosting.be` without
 exposing Proxmox to the internet. One shared gateway CT does all ingress; tenant
 CTs stay on the private bridge with no public ports.
 
@@ -11,22 +11,22 @@ CTs stay on the private bridge with no public ports.
                        │   (TLS terminated here, wildcard cert from CF)
                        ▼
               cloudflared (gateway CT)
-                       │   (single Tunnel, ingress: *.brieblast.tld → 127.0.0.1:80)
+                       │   (single Tunnel, ingress: *.briehosting.be → 127.0.0.1:80)
                        ▼
                   Caddy (gateway CT)
                        │   (host-header routing, upstream looked up dynamically)
               ┌────────┼────────┐
               ▼        ▼        ▼
          tenant CT  tenant CT  tenant CT
-         10.0.0.5   10.0.0.6   10.0.0.7
+         192.168.10.50   192.168.10.51   192.168.10.52
          (Apache)   (Apache)   (Apache)
 ```
 
-1. User requests `https://acme.brieblast.tld`.
+1. User requests `https://acme.briehosting.be`.
 2. Cloudflare resolves the wildcard CNAME to the tunnel and forwards the
    request through `cloudflared`. No public IP, no open ports on OPNsense.
 3. `cloudflared` hands the request to Caddy on `127.0.0.1:80`.
-4. Caddy reads the `Host` header (`acme.brieblast.tld`), pulls the matching
+4. Caddy reads the `Host` header (`acme.briehosting.be`), pulls the matching
    `slug → ip_address` row from Supabase, and reverse-proxies to that tenant CT.
 5. Tenant CT serves the PHP site over plain HTTP on the private bridge.
 
@@ -48,7 +48,7 @@ provisioned CTs use (e.g. `vmbr1`).
 | Distro      | Debian 12 (matches the tenant template)            |
 | Cores / RAM | 1 core, 512 MB is plenty                           |
 | Disk        | 4 GB                                               |
-| Network     | bridge `vmbr1`, **static IP** (e.g. `10.0.0.2/24`) |
+| Network     | bridge `vmbr1`, **static IP** (e.g. `192.168.10.208/24`) |
 | Features    | `nesting=1` (lets cloudflared run cleanly)         |
 
 Static IP matters: Caddy and `cloudflared` only listen on `127.0.0.1`, but
@@ -71,7 +71,7 @@ on every request, so no extra DNS plumbing is needed inside the tenant network.
 
 ### A. Domain
 
-Either `brieblast.tld` is already on Cloudflare, or add it now (Cloudflare's
+Either `briehosting.be` is already on Cloudflare, or add it now (Cloudflare's
 "Add site" flow, then point the registrar's nameservers at CF).
 
 ### B. Tunnel
@@ -84,13 +84,13 @@ In **Zero Trust → Networks → Tunnels**:
    register it with that token.
 3. Add a **Public Hostname** entry on the tunnel:
    - Subdomain: `*`
-   - Domain: `brieblast.tld`
+   - Domain: `briehosting.be`
    - Service: `HTTP`, URL: `localhost:80`
-4. Save. Cloudflare auto-creates the wildcard CNAME `*.brieblast.tld → <tunnel-id>.cfargotunnel.com` (proxied, orange cloud).
+4. Save. Cloudflare auto-creates the wildcard CNAME `*.briehosting.be → <tunnel-id>.cfargotunnel.com` (proxied, orange cloud).
 
 ### C. Reserve the apex (optional)
 
-If you want `brieblast.tld` itself to keep pointing at the marketing site,
+If you want `briehosting.be` itself to keep pointing at the marketing site,
 leave the existing `@` A/AAAA record alone. The wildcard only matches
 subdomains.
 
@@ -99,7 +99,7 @@ subdomains.
 | Component        | Host         | Notes                                                |
 |------------------|--------------|------------------------------------------------------|
 | API + worker     | API CT       | unchanged — still writes `sites.ip_address` on live  |
-| `cloudflared`    | gateway CT   | one tunnel, ingress `*.brieblast.tld → 127.0.0.1:80` |
+| `cloudflared`    | gateway CT   | one tunnel, ingress `*.briehosting.be → 127.0.0.1:80` |
 | Caddy            | gateway CT   | dynamic upstream lookup against Supabase             |
 | Apache + site    | tenant CT    | unchanged                                            |
 | Routing truth    | Supabase     | `sites.subdomain → sites.ip_address`                 |
@@ -120,149 +120,108 @@ live transition; Caddy looks it up on every request.
 
 ## Installing the gateway (cloudflared + Caddy)
 
-Manual install, top-to-bottom on the gateway CT (`brie-gw`). The Ansible role
-that automates this hasn't been written yet — follow these steps for the first
-gateway and we can codify them later.
-
-All commands run as `root` inside the CT.
-
-### 1. Base packages
+Automated by the `gateway_setup` Ansible role. From the API CT (where you run
+the other playbooks):
 
 ```bash
-apt-get update
-apt-get install -y curl ca-certificates debian-keyring debian-archive-keyring \
-                   apt-transport-https gnupg
+# 1. Reserve the gateway CT's static IP in inventory/group_vars/gateway.yml.
+#    Defaults: gateway_admin_bind_ip=192.168.10.208, gateway_admin_allowed_source=192.168.10.136
+#    (= the API CT's IP), gateway_domain=briehosting.be. Edit if yours differ.
+
+# 2. Make sure the gateway is reachable over SSH as root:
+ssh root@192.168.10.208 'echo ok'
+
+# 3. Run the playbook with the Cloudflare tunnel token in the env.
+#    Token = the eyJ... blob from the dashboard, NOT the tunnel UUID.
+cd infra/ansible
+CLOUDFLARED_TUNNEL_TOKEN=eyJ... \
+  ansible-playbook -i inventory/production.ini playbooks/setup_gateway.yml
 ```
 
-### 2. cloudflared
+What the role does, in order:
 
-Cloudflare publishes its own apt repo. Don't use the static `.deb` from a blog
-post — it won't auto-update.
+1. Installs base packages (`curl`, `gnupg`, `nftables`, repo helpers).
+2. Adds Cloudflare's apt repo, installs `cloudflared`, and runs
+   `cloudflared service install <TOKEN>` once (gated on the systemd unit not
+   already existing — re-runs are no-ops).
+3. Adds Cloudsmith's Caddy apt repo and installs `caddy`.
+4. Renders `/etc/caddy/Caddyfile` from the role template (admin API bound to
+   `gateway_admin_bind_ip:2019`, catchall 404), validates with
+   `caddy validate`, and reloads.
+5. Renders `/etc/nftables.conf` so `tcp dport 2019` is dropped from any source
+   that isn't `gateway_admin_allowed_source`.
+
+Re-running the playbook is safe — it rotates the Caddyfile and nftables config
+in place. The cloudflared registration is the one step that's deliberately
+not re-run; if you need to re-register against a new tunnel, remove
+`/etc/systemd/system/cloudflared.service` first.
+
+### Verify
 
 ```bash
-mkdir -p --mode=0755 /usr/share/keyrings
-curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
-  | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
-
-echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared bookworm main" \
-  > /etc/apt/sources.list.d/cloudflared.list
-
-apt-get update
-apt-get install -y cloudflared
+ssh root@192.168.10.208 systemctl status cloudflared caddy nftables
 ```
 
-Register the tunnel using the token Cloudflare gave you when you created the
-`brie-gw` tunnel (the `eyJ...` blob, not the tunnel ID):
+In the Cloudflare dashboard the tunnel should be **Healthy** within seconds.
+
+### API CT configuration
+
+Set these on the API CT's `.env` so the worker knows where to push routes:
 
 ```bash
-cloudflared service install <TOKEN>
-systemctl status cloudflared       # should be active (running)
+GATEWAY_CADDY_ADMIN_URL=http://192.168.10.208:2019
+GATEWAY_DOMAIN=briehosting.be
 ```
 
-This installs a systemd unit, stores the token under `/etc/cloudflared/`, and
-starts the tunnel. In the Cloudflare dashboard the tunnel should flip to
-**Healthy** within a few seconds.
+Restart the API service after editing.
 
-### 3. Caddy
-
-We need a Caddy build that can do **dynamic upstream selection** — i.e. pick
-the upstream per request based on the `Host` header. The standard Debian
-package can do this with the built-in `dynamic_upstreams` of the `reverse_proxy`
-directive plus a small lookup. Install the official build first:
-
-```bash
-curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
-  | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-
-curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
-  > /etc/apt/sources.list.d/caddy-stable.list
-
-apt-get update
-apt-get install -y caddy
-```
-
-Verify:
-
-```bash
-caddy version          # v2.7+ ships dynamic_upstreams
-systemctl status caddy
-```
-
-### 4. Caddyfile
-
-Drop this at `/etc/caddy/Caddyfile`. The lookup helper at `/__upstream` is a
-tiny PostgREST/Supabase call wrapped by `caddy` itself — it asks the API CT
-for the IP behind a given subdomain.
-
-```caddy
-{
-    # No automatic HTTPS — TLS is terminated at the Cloudflare edge and the
-    # tunnel hands us plain HTTP on 127.0.0.1:80.
-    auto_https off
-    admin off
-}
-
-:80 {
-    @hasSubdomain header_regexp host Host ^(?P<slug>[a-z0-9-]+)\.brieblast\.tld$
-
-    handle @hasSubdomain {
-        reverse_proxy {
-            dynamic a {
-                # Resolve <slug>.tenants.brie.internal via the lookup service
-                # below; tenant CTs are not in public DNS, this is a private zone.
-                name {re.host.slug}.tenants.brie.internal
-                refresh 30s
-            }
-            header_up Host {http.request.host}
-        }
-    }
-
-    handle {
-        respond "brieblast gateway: unknown host" 404
-    }
-}
-```
-
-> The "lookup service" piece is intentionally hand-wavy — it's the one bit we
-> still need to decide between (a) a custom Caddy plugin doing a direct
-> Supabase REST call, or (b) a tiny FastAPI route on the API CT that returns
-> `<ip>` for a slug and gets fronted by the API's existing auth. Either fits
-> on top of this Caddyfile without changing it. **TODO before going live.**
-
-Reload after edits:
-
-```bash
-caddy validate --config /etc/caddy/Caddyfile
-systemctl reload caddy
-```
-
-### 5. Smoke test
+### Smoke test
 
 From the gateway CT itself, simulating what cloudflared sends:
 
 ```bash
-curl -H 'Host: <existing-slug>.brieblast.tld' http://127.0.0.1/
+curl -H 'Host: <existing-slug>.briehosting.be' http://127.0.0.1/
 ```
 
 You should get the tenant site's index page. Then from anywhere on the public
 internet:
 
 ```bash
-curl -I https://<existing-slug>.brieblast.tld/
+curl -I https://<existing-slug>.briehosting.be/
 ```
 
 Cloudflare's `cf-ray` header in the response confirms the request went
 edge → tunnel → Caddy → tenant.
 
+## What's already built
+
+- `app/gateway.py` — Caddy admin API client (route push/remove + bulk replace
+  + subdomain derivation).
+- `app/worker.py` — pushes a route and persists `subdomain` on the live
+  transition. Failures are logged but never flip a healthy site to `failed`.
+- `app/sync_gateway.py` — bulk re-hydration. Runs automatically on API CT
+  startup, and also as a CLI: `python -m app.sync_gateway`.
+- `sql/004_sites_ip_vmid.sql` — adds `subdomain` with a partial unique index.
+
+## Recovering after a gateway reboot
+
+Caddy keeps dynamic routes in memory, so when the gateway CT reboots all
+per-site routes vanish and tenants 404 until they're replayed. Two ways to
+recover:
+
+```bash
+# Option A: restart the API service. The startup hook re-syncs everything.
+systemctl restart briehost-api
+
+# Option B: manual one-shot from the API CT (no API restart needed).
+cd /opt/briehost-api && uv run python -m app.sync_gateway
+```
+
+Both read `status='live'` rows from Supabase and PATCH the full route set into
+srv0 in one call. Idempotent — safe to run any time, even if the gateway is
+already in sync.
+
 ## What still needs to be built
 
-This doc covers the manual prerequisites and one-time install. Code changes
-to follow:
-
-- Ansible role `gateway_setup` — codifies steps 1–4 above so the gateway CT
-  can be rebuilt from scratch.
-- Lookup mechanism for Caddy's `dynamic_upstreams` (Caddy plugin vs. FastAPI
-  shim) — see the TODO in the Caddyfile section.
-- Worker change: assign and persist `sites.subdomain` on the live transition
-  (defaulting to the slug, with a uniqueness retry), and surface it in the
-  `/sites` API response so the dashboard can show the public URL.
+- Surface `subdomain` in the `/sites` API response so the dashboard can show
+  the public URL.

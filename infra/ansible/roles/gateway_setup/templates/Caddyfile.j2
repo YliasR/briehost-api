@@ -1,0 +1,18 @@
+{
+    # TLS terminated at the Cloudflare edge; tunnel hands us plain HTTP.
+    auto_https off
+
+    # Admin API must be reachable from the API CT so the worker can push
+    # routes. Bound to the gateway's tenant-bridge IP and locked down with
+    # nftables (see /etc/nftables.conf rendered by this same role).
+    admin {{ gateway_admin_bind_ip }}:2019
+}
+
+:80 {
+    # Per-site routes are inserted ahead of this block at runtime by the
+    # API worker (POST /config/apps/http/servers/srv0/routes/0). Anything
+    # that falls through here is an unknown subdomain.
+    handle {
+        respond "Brieblast gateway: unknown host" 404
+    }
+}

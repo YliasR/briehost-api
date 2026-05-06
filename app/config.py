@@ -52,6 +52,15 @@ class Settings:
     )
     max_zip_compression_ratio: int = int(os.getenv("MAX_ZIP_COMPRESSION_RATIO", "200") or 200)
 
+    # Public subdomain gateway (Caddy + cloudflared on a separate CT).
+    # Empty url disables registration — useful for local dev.
+    # See CLOUDFLARE_GATEWAY_SETUP.md.
+    gateway_caddy_admin_url: str = os.getenv("GATEWAY_CADDY_ADMIN_URL", "")
+    gateway_domain: str = os.getenv("GATEWAY_DOMAIN", "")
+    gateway_request_timeout_seconds: int = int(
+        os.getenv("GATEWAY_REQUEST_TIMEOUT_SECONDS", "5") or 5
+    )
+
     allowed_origins: list[str] = [
         o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",") if o.strip()
     ]

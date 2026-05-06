@@ -1,0 +1,14 @@
+---
+- name: apt update
+  ansible.builtin.apt:
+    update_cache: true
+
+- name: reload caddy
+  ansible.builtin.systemd:
+    name: caddy
+    state: reloaded
+
+- name: reload nftables
+  ansible.builtin.systemd:
+    name: nftables
+    state: restarted

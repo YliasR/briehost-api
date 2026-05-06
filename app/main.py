@@ -1,8 +1,13 @@
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.routes import sites
+from app.sync_gateway import resync as resync_gateway
+
+log = logging.getLogger("briehost.main")
 
 app = FastAPI(title="briehost-api")
 
@@ -16,6 +21,16 @@ app.add_middleware(
 )
 
 app.include_router(sites.router)
+
+
+@app.on_event("startup")
+def _resync_gateway_on_boot() -> None:
+    # Best-effort: if the gateway is unreachable (rebooting, not yet provisioned)
+    # the API still starts. Operators can re-run `python -m app.sync_gateway`.
+    try:
+        resync_gateway(settings)
+    except Exception:
+        log.exception("gateway resync on startup failed; continuing")
 
 
 @app.get("/healthz")

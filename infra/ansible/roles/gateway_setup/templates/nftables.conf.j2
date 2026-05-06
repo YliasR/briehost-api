@@ -1,0 +1,25 @@
+#!/usr/sbin/nft -f
+# Managed by ansible role gateway_setup. Hand edits will be overwritten.
+
+flush ruleset
+
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy accept;
+
+        # Always allow loopback + established/related.
+        iif lo accept
+        ct state established,related accept
+
+        # Caddy admin API: only the API CT may reach :2019.
+        tcp dport 2019 ip saddr != {{ gateway_admin_allowed_source }} drop
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy accept;
+    }
+
+    chain output {
+        type filter hook output priority 0; policy accept;
+    }
+}

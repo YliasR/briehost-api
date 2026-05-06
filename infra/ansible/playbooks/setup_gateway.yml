@@ -1,0 +1,30 @@
+---
+# One-shot playbook to install + configure the briehost gateway CT (brie-gw).
+# See CLOUDFLARE_GATEWAY_SETUP.md for the manual prerequisites this assumes:
+#   - the CT exists with a static IP on the tenant bridge
+#   - the Cloudflare tunnel was created in the dashboard and you have its token
+#
+# Run with:
+#   CLOUDFLARED_TUNNEL_TOKEN=eyJ... \
+#     ansible-playbook -i inventory/production.ini playbooks/setup_gateway.yml
+
+- name: Set up brieblast gateway (cloudflared + Caddy)
+  hosts: gateway
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Validate required vars
+      ansible.builtin.assert:
+        that:
+          - cloudflared_tunnel_token is defined and cloudflared_tunnel_token | length > 0
+          - gateway_admin_bind_ip is defined and gateway_admin_bind_ip | length > 0
+          - gateway_admin_allowed_source is defined and gateway_admin_allowed_source | length > 0
+          - gateway_domain is defined and gateway_domain | length > 0
+        fail_msg: >-
+          Missing gateway vars. Set CLOUDFLARED_TUNNEL_TOKEN in the environment
+          and confirm group_vars/gateway.yml has admin bind IP, allowed source,
+          and gateway domain.
+
+  roles:
+    - gateway_setup

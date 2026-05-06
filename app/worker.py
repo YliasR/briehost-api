@@ -17,6 +17,7 @@ from pathlib import Path
 
 from app.config import Settings
 from app.db import admin_client
+from app.gateway import derive_subdomain, register_route
 from app.scanner import MalwareDetected, ScanError, clamd_scan
 from app.storage import UnsafeZipError, validate_zip_policy
 
@@ -190,13 +191,14 @@ def provision_site(settings: Settings, site_id: str, user_id: str, zip_path: Pat
             return
 
         if rc == 0:
-            # Mark live first so a failure to persist the IP/VMID extras (e.g. the
-            # ip_address/vmid columns are missing on this DB) can't flip a healthy
-            # site to "failed" via the outer except.
+            # Mark live first so a failure in any of the post-live writes (extras,
+            # subdomain, gateway push) can't flip a healthy site to "failed".
             _set_status(site_id, STATUS_LIVE)
             parsed = _parse_ansible_result(stdout)
+
+            ip = parsed.get("ip")
             extra: dict[str, object] = {}
-            if ip := parsed.get("ip"):
+            if ip:
                 extra["ip_address"] = ip
             if vmid := parsed.get("vmid"):
                 try:
@@ -208,6 +210,34 @@ def provision_site(settings: Settings, site_id: str, user_id: str, zip_path: Pat
                     admin_client().table("sites").update(extra).eq("id", site_id).execute()
                 except Exception:
                     log.exception("could not persist live extras for site_id=%s", site_id)
+
+            # Public subdomain assignment + gateway route push. Each is best-effort
+            # and persisted in its own UPDATE so a unique-constraint collision on
+            # subdomain doesn't lose the IP/VMID write above.
+            site_slug = zip_path.stem.removesuffix(f"-{site_id}") or "site"
+            subdomain = derive_subdomain(site_slug)
+            if subdomain and ip:
+                try:
+                    register_route(settings, subdomain, ip)
+                except Exception:
+                    log.exception(
+                        "gateway route push failed for site_id=%s subdomain=%s",
+                        site_id,
+                        subdomain,
+                    )
+                try:
+                    admin_client().table("sites").update(
+                        {"subdomain": subdomain}
+                    ).eq("id", site_id).execute()
+                except Exception:
+                    # Most likely cause: unique-index collision with another tenant
+                    # already holding this slug. The site is still live; the user
+                    # can pick a different subdomain via the dashboard later.
+                    log.exception(
+                        "subdomain assign failed (collision?) for site_id=%s subdomain=%s",
+                        site_id,
+                        subdomain,
+                    )
         else:
             tail = (stderr or stdout)[-_TRIM:]
             _set_status(site_id, STATUS_FAILED, f"ansible rc={rc}: {tail}")

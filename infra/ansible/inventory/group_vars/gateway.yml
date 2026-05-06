@@ -1,0 +1,16 @@
+---
+# Vars for the gateway CT (brie-gw). See CLOUDFLARE_GATEWAY_SETUP.md.
+
+# Cloudflare tunnel token (eyJ... blob). Sourced from env so it stays out of git.
+cloudflared_tunnel_token: "{{ lookup('env', 'CLOUDFLARED_TUNNEL_TOKEN') }}"
+
+# Gateway CT's static IP on the tenant bridge. Caddy's admin API binds here,
+# and the worker on the API CT POSTs to http://<this>:2019/config/...
+gateway_admin_bind_ip: "192.168.10.208"
+
+# Source IP allowed to reach :2019 (the API CT). Anything else is dropped
+# by nftables to avoid tenant CTs poking at Caddy's admin port.
+gateway_admin_allowed_source: "192.168.10.136"
+
+# Public apex domain that wildcards into Cloudflare Tunnel.
+gateway_domain: "briehosting.be"

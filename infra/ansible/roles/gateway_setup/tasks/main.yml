@@ -1,0 +1,122 @@
+---
+# Install + configure cloudflared and Caddy on the gateway CT.
+# Idempotent: re-running rotates the Caddyfile/nftables config and reloads,
+# but only re-installs the cloudflared service if its systemd unit is missing.
+
+- name: Install base packages (curl, gnupg, repos, nftables)
+  ansible.builtin.apt:
+    name:
+      - curl
+      - ca-certificates
+      - gnupg
+      - apt-transport-https
+      - debian-keyring
+      - debian-archive-keyring
+      - nftables
+    state: present
+    update_cache: true
+
+# --- cloudflared ----------------------------------------------------------
+
+- name: Ensure /usr/share/keyrings exists
+  ansible.builtin.file:
+    path: /usr/share/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Install cloudflared apt signing key
+  ansible.builtin.get_url:
+    url: https://pkg.cloudflare.com/cloudflare-main.gpg
+    dest: /usr/share/keyrings/cloudflare-main.gpg
+    mode: "0644"
+
+- name: Add cloudflared apt repo
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/cloudflared.list
+    content: >-
+      deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg]
+      https://pkg.cloudflare.com/cloudflared {{ ansible_distribution_release }} main
+    mode: "0644"
+  notify: apt update
+
+- name: Apply pending apt updates before installing cloudflared
+  ansible.builtin.meta: flush_handlers
+
+- name: Install cloudflared
+  ansible.builtin.apt:
+    name: cloudflared
+    state: present
+    update_cache: true
+
+- name: Check whether cloudflared systemd unit is already registered
+  ansible.builtin.stat:
+    path: /etc/systemd/system/cloudflared.service
+  register: cloudflared_unit
+
+- name: Register cloudflared with the tunnel token (one-time)
+  ansible.builtin.command: cloudflared service install {{ cloudflared_tunnel_token }}
+  args:
+    creates: /etc/systemd/system/cloudflared.service
+  no_log: true
+  when: not cloudflared_unit.stat.exists
+
+- name: Ensure cloudflared is enabled + running
+  ansible.builtin.systemd:
+    name: cloudflared
+    enabled: true
+    state: started
+
+# --- Caddy ----------------------------------------------------------------
+
+- name: Install Caddy apt signing key
+  ansible.builtin.get_url:
+    url: https://dl.cloudsmith.io/public/caddy/stable/gpg.key
+    dest: /etc/apt/keyrings/caddy-stable-archive-keyring.asc
+    mode: "0644"
+
+- name: Add Caddy apt repo
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/caddy-stable.list
+    content: |
+      deb [signed-by=/etc/apt/keyrings/caddy-stable-archive-keyring.asc] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main
+      deb-src [signed-by=/etc/apt/keyrings/caddy-stable-archive-keyring.asc] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main
+    mode: "0644"
+  notify: apt update
+
+- name: Apply pending apt updates before installing caddy
+  ansible.builtin.meta: flush_handlers
+
+- name: Install Caddy
+  ansible.builtin.apt:
+    name: caddy
+    state: present
+    update_cache: true
+
+- name: Render Caddyfile
+  ansible.builtin.template:
+    src: Caddyfile.j2
+    dest: /etc/caddy/Caddyfile
+    mode: "0644"
+    validate: "caddy validate --config %s"
+  notify: reload caddy
+
+- name: Ensure caddy is enabled + running
+  ansible.builtin.systemd:
+    name: caddy
+    enabled: true
+    state: started
+
+# --- nftables (lock admin API to the API CT only) -------------------------
+
+- name: Render nftables rules
+  ansible.builtin.template:
+    src: nftables.conf.j2
+    dest: /etc/nftables.conf
+    mode: "0644"
+  notify: reload nftables
+
+- name: Ensure nftables is enabled + running
+  ansible.builtin.systemd:
+    name: nftables
+    enabled: true
+    state: started
