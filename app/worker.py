@@ -190,6 +190,10 @@ def provision_site(settings: Settings, site_id: str, user_id: str, zip_path: Pat
             return
 
         if rc == 0:
+            # Mark live first so a failure to persist the IP/VMID extras (e.g. the
+            # ip_address/vmid columns are missing on this DB) can't flip a healthy
+            # site to "failed" via the outer except.
+            _set_status(site_id, STATUS_LIVE)
             parsed = _parse_ansible_result(stdout)
             extra: dict[str, object] = {}
             if ip := parsed.get("ip"):
@@ -199,7 +203,11 @@ def provision_site(settings: Settings, site_id: str, user_id: str, zip_path: Pat
                     extra["vmid"] = int(vmid)
                 except ValueError:
                     pass
-            _set_status(site_id, STATUS_LIVE, extra=extra or None)
+            if extra:
+                try:
+                    admin_client().table("sites").update(extra).eq("id", site_id).execute()
+                except Exception:
+                    log.exception("could not persist live extras for site_id=%s", site_id)
         else:
             tail = (stderr or stdout)[-_TRIM:]
             _set_status(site_id, STATUS_FAILED, f"ansible rc={rc}: {tail}")
