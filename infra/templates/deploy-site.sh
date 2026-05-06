@@ -122,23 +122,25 @@ if [[ -f "$WEB_ROOT/artisan" && -f "$WEB_ROOT/composer.json" && -d "$WEB_ROOT/pu
     # Install dependencies as www-data so the resulting vendor/ tree is owned
     # correctly. --no-dev keeps the install lean; --no-interaction prevents
     # composer from blocking on prompts.
+    # Minimal LXC images don't ship sudo — use runuser (util-linux, always present).
     if [[ ! -d "$WEB_ROOT/vendor" ]]; then
-        sudo -u "$WEB_USER" \
-            COMPOSER_ALLOW_SUPERUSER=0 \
-            COMPOSER_HOME="$WEB_ROOT/.composer-home" \
-            composer install \
-                --working-dir="$WEB_ROOT" \
-                --no-dev \
-                --no-interaction \
-                --optimize-autoloader \
-                --prefer-dist
+        runuser -u "$WEB_USER" -- \
+            env COMPOSER_ALLOW_SUPERUSER=0 \
+                COMPOSER_HOME="$WEB_ROOT/.composer-home" \
+                composer install \
+                    --working-dir="$WEB_ROOT" \
+                    --no-dev \
+                    --no-interaction \
+                    --optimize-autoloader \
+                    --prefer-dist
     else
         echo "vendor/ already present in zip — skipping composer install."
     fi
 
     # APP_KEY: required for sessions/encryption. Generate only if missing.
     if [[ -f "$WEB_ROOT/.env" ]] && ! grep -qE '^APP_KEY=base64:' "$WEB_ROOT/.env"; then
-        sudo -u "$WEB_USER" php "$WEB_ROOT/artisan" key:generate --force --no-interaction
+        runuser -u "$WEB_USER" -- \
+            php "$WEB_ROOT/artisan" key:generate --force --no-interaction
     fi
 
     # Laravel needs to write to storage/ and bootstrap/cache/ at runtime.
