@@ -47,6 +47,8 @@
       # Template uses nginx + php-fpm; no apache modules to enable. mod_rewrite
       # is an Apache concept — nginx replaces it with `try_files` directives,
       # which we set per-site in the deploy script.
+      # php8.2-sqlite3 ships with the sqlite CLI binary too, so artisan migrate
+      # against a sqlite file works without any DB server running per-tenant.
       ansible.builtin.command: >-
         pct exec {{ template_vmid }} --
         apt-get install -y -qq
@@ -54,6 +56,8 @@
         php8.2-bcmath
         php8.2-curl
         php8.2-zip
+        php8.2-sqlite3
+        sqlite3
         unzip
       register: apt_install
       changed_when: "'newly installed' in apt_install.stdout or 'upgraded' in apt_install.stdout"

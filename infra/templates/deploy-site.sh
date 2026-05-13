@@ -130,9 +130,35 @@ EOF
 if [[ -f "$WEB_ROOT/artisan" && -f "$WEB_ROOT/composer.json" && -d "$WEB_ROOT/public" ]]; then
     echo "Laravel project detected — running framework setup."
 
-    # Bootstrap .env. Laravel's default workflow is to copy .env.example.
-    if [[ ! -f "$WEB_ROOT/.env" && -f "$WEB_ROOT/.env.example" ]]; then
-        cp "$WEB_ROOT/.env.example" "$WEB_ROOT/.env"
+    # Bootstrap .env. Laravel's normal workflow is to copy .env.example, but
+    # plenty of zips ship without one (gitignored, packaged from a clean
+    # source tree, etc). Without .env, Laravel falls back to whatever is
+    # baked into bootstrap/cache/config.php — which for shipped projects is
+    # almost always the original mysql connection. So if neither file exists,
+    # synthesize a minimal .env that key:generate + set_env_var can fill in.
+    if [[ ! -f "$WEB_ROOT/.env" ]]; then
+        if [[ -f "$WEB_ROOT/.env.example" ]]; then
+            cp "$WEB_ROOT/.env.example" "$WEB_ROOT/.env"
+        else
+            cat > "$WEB_ROOT/.env" <<'ENV'
+APP_NAME=Brieblast
+APP_ENV=production
+APP_KEY=
+APP_DEBUG=false
+APP_URL=http://localhost
+
+LOG_CHANNEL=stack
+LOG_LEVEL=error
+
+DB_CONNECTION=sqlite
+
+SESSION_DRIVER=database
+SESSION_LIFETIME=120
+
+CACHE_STORE=database
+QUEUE_CONNECTION=database
+ENV
+        fi
         chown "$WEB_USER:$WEB_USER" "$WEB_ROOT/.env"
     fi
 
@@ -160,8 +186,33 @@ if [[ -f "$WEB_ROOT/artisan" && -f "$WEB_ROOT/composer.json" && -d "$WEB_ROOT/pu
             php "$WEB_ROOT/artisan" key:generate --force --no-interaction
     fi
 
-    # Laravel needs to write to storage/ and bootstrap/cache/ at runtime.
-    # 0775 + group www-data is the conventional permission.
+    # Force the DB connection to sqlite — no per-tenant MySQL daemon means the
+    # default DB_CONNECTION=mysql in shipped .env.example files would explode
+    # on the first DB-touching route. SQLite is a single file under storage/.
+    # set_env_var <KEY> <VALUE>: rewrite if present, append if missing.
+    set_env_var() {
+        local key="$1"
+        local value="$2"
+        if grep -qE "^${key}=" "$WEB_ROOT/.env"; then
+            sed -i "s|^${key}=.*|${key}=${value}|" "$WEB_ROOT/.env"
+        else
+            echo "${key}=${value}" >> "$WEB_ROOT/.env"
+        fi
+    }
+    SQLITE_PATH="$WEB_ROOT/database/database.sqlite"
+    mkdir -p "$WEB_ROOT/database"
+    touch "$SQLITE_PATH"
+    set_env_var DB_CONNECTION sqlite
+    set_env_var DB_DATABASE "$SQLITE_PATH"
+    # Blank out MySQL-specific keys so Laravel doesn't try to honor them.
+    for k in DB_HOST DB_PORT DB_USERNAME DB_PASSWORD; do
+        if grep -qE "^${k}=" "$WEB_ROOT/.env"; then
+            sed -i "s|^${k}=.*|${k}=|" "$WEB_ROOT/.env"
+        fi
+    done
+
+    # Laravel needs to write to storage/, bootstrap/cache/, and the sqlite
+    # file at runtime. 0775 + group www-data is the conventional permission.
     if [[ -d "$WEB_ROOT/storage" ]]; then
         chown -R "$WEB_USER:$WEB_USER" "$WEB_ROOT/storage"
         chmod -R ug+rwX "$WEB_ROOT/storage"
@@ -169,6 +220,29 @@ if [[ -f "$WEB_ROOT/artisan" && -f "$WEB_ROOT/composer.json" && -d "$WEB_ROOT/pu
     if [[ -d "$WEB_ROOT/bootstrap/cache" ]]; then
         chown -R "$WEB_USER:$WEB_USER" "$WEB_ROOT/bootstrap/cache"
         chmod -R ug+rwX "$WEB_ROOT/bootstrap/cache"
+    fi
+    chown -R "$WEB_USER:$WEB_USER" "$WEB_ROOT/database"
+    chmod -R ug+rwX "$WEB_ROOT/database"
+    chown "$WEB_USER:$WEB_USER" "$WEB_ROOT/.env"
+
+    # Clear cached config/routes/views BEFORE migrate. Many zips ship with a
+    # populated bootstrap/cache/config.php (left over from local `artisan
+    # config:cache` or a CI pipeline) — that snapshot holds the original
+    # mysql connection settings and ignores everything we just wrote to .env.
+    # Result without this step: Laravel still tries DB_CONNECTION=mysql,
+    # migrate fails with "could not find driver", site boots into a 500 loop.
+    for cmd in config:clear cache:clear route:clear view:clear; do
+        runuser -u "$WEB_USER" -- \
+            php "$WEB_ROOT/artisan" "$cmd" --no-interaction || true
+    done
+
+    # Run migrations against the sqlite file. Schema is empty on a fresh deploy,
+    # so this populates tables defined in database/migrations/. Failures here
+    # shouldn't kill the whole deploy — some apps may not ship migrations.
+    if [[ -d "$WEB_ROOT/database/migrations" ]]; then
+        runuser -u "$WEB_USER" -- \
+            php "$WEB_ROOT/artisan" migrate --force --no-interaction || \
+            echo "WARNING: artisan migrate failed — site will boot but DB-backed features may not work." >&2
     fi
 
     write_nginx_vhost "$WEB_ROOT/public" laravel
