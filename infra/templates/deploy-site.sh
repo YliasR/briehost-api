@@ -130,6 +130,18 @@ EOF
 if [[ -f "$WEB_ROOT/artisan" && -f "$WEB_ROOT/composer.json" && -d "$WEB_ROOT/public" ]]; then
     echo "Laravel project detected — running framework setup."
 
+    # Nuke any cached config/routes/services shipped in the zip BEFORE doing
+    # anything else. These are PHP files containing a frozen snapshot of the
+    # project's env (often with DB_CONNECTION=mysql baked in). They take
+    # priority over .env at runtime, and `artisan config:clear` can't help
+    # us — artisan boots Laravel, which loads the broken cache first and
+    # crashes before it can delete itself. Has to be a plain rm.
+    rm -f "$WEB_ROOT/bootstrap/cache/config.php" \
+          "$WEB_ROOT/bootstrap/cache/routes-v7.php" \
+          "$WEB_ROOT/bootstrap/cache/services.php" \
+          "$WEB_ROOT/bootstrap/cache/packages.php" \
+          "$WEB_ROOT/bootstrap/cache/events.php"
+
     # Bootstrap .env. Laravel's normal workflow is to copy .env.example, but
     # plenty of zips ship without one (gitignored, packaged from a clean
     # source tree, etc). Without .env, Laravel falls back to whatever is
