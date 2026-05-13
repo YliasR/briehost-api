@@ -11,8 +11,6 @@ import logging
 import re
 import shlex
 import subprocess
-import shutil
-import tempfile
 import threading
 import zipfile
 from pathlib import Path
@@ -143,80 +141,6 @@ def _run_ansible(
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
-def _zip_info_is_symlink(info: zipfile.ZipInfo) -> bool:
-    return ((info.external_attr >> 16) & 0o170000) == 0o120000
-
-
-def _scan_with_php_malware_finder(settings: Settings, zip_path: Path) -> None:
-    scanner_path = getattr(settings, "php_malware_finder_path", None)
-    if not scanner_path:
-        scanner_path = shutil.which("phpmalwarefinder") or shutil.which("yara")
-    if not scanner_path:
-        raise ScanError("php-malware-finder scanner is not installed or configured")
-
-    rules_path = getattr(settings, "php_malware_finder_rules_path", None)
-    if not rules_path:
-        scanner_candidate = Path(scanner_path)
-        if scanner_candidate.exists():
-            sibling_rules = scanner_candidate.resolve().with_name("php.yar")
-            if sibling_rules.is_file():
-                rules_path = str(sibling_rules)
-
-    if not rules_path:
-        bundled_rules = Path(__file__).resolve().with_name("php.yar")
-        if bundled_rules.is_file():
-            rules_path = str(bundled_rules)
-
-    if not rules_path:
-        raise ScanError("php-malware-finder rules are not installed or configured")
-
-    timeout = getattr(
-        settings,
-        "php_malware_finder_timeout_seconds",
-        getattr(settings, "ansible_timeout_seconds", 300),
-    )
-
-    with tempfile.TemporaryDirectory(prefix="php-scan-") as tmpdir:
-        extract_dir = Path(tmpdir).resolve()
-
-        with zipfile.ZipFile(zip_path) as archive:
-            for info in archive.infolist():
-                if info.is_dir():
-                    continue
-                if _zip_info_is_symlink(info):
-                    raise MalwareDetected(f"zip contains symlink entry: {info.filename}")
-
-                target_path = (extract_dir / info.filename).resolve()
-                if target_path != extract_dir and extract_dir not in target_path.parents:
-                    raise MalwareDetected(f"zip contains unsafe path entry: {info.filename}")
-
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-                with archive.open(info) as source, target_path.open("wb") as destination:
-                    shutil.copyfileobj(source, destination)
-
-        command = [
-            scanner_path,
-            "-r" if Path(scanner_path).name == "yara" else "-c",
-            rules_path,
-            str(extract_dir),
-        ]
-        log.info("running php malware scan: %s", " ".join(shlex.quote(c) for c in command))
-        proc = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-
-        stdout = (proc.stdout or "").strip()
-        stderr = (proc.stderr or "").strip()
-        if stdout:
-            raise MalwareDetected(stdout[:_TRIM])
-        if proc.returncode != 0 or stderr:
-            raise ScanError(stderr[:_TRIM] or f"php-malware-finder exited with rc={proc.returncode}")
-
-
 def provision_site(settings: Settings, site_id: str, user_id: str, zip_path: Path) -> None:
     """Full pipeline for one upload. Safe to run as a fire-and-forget task."""
     _inflight_inc()
@@ -249,15 +173,6 @@ def provision_site(settings: Settings, site_id: str, user_id: str, zip_path: Pat
             return
 
         if settings.enable_malware_scan:
-            try:
-                _scan_with_php_malware_finder(settings, zip_path)
-            except MalwareDetected as exc:
-                _set_status(site_id, STATUS_SCAN_FAILED, f"php malware: {exc}")
-                return
-            except ScanError as exc:
-                _set_status(site_id, STATUS_SCAN_FAILED, f"php scanner unavailable: {exc}")
-                return
-
             try:
                 clamd_scan(
                     zip_path,
