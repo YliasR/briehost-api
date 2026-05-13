@@ -1,4 +1,5 @@
-"""Site upload endpoint."""
+"""Site upload + teardown endpoints."""
+import logging
 import uuid
 from pathlib import Path
 
@@ -8,7 +9,9 @@ from app.auth import current_user_id
 from app.config import Settings, get_settings
 from app.db import admin_client
 from app.storage import site_zip_path, slugify
-from app.worker import STATUS_UPLOADED, enqueue_provision, inflight_count
+from app.worker import STATUS_UPLOADED, enqueue_provision, enqueue_teardown, inflight_count
+
+log = logging.getLogger("briehost.routes.sites")
 
 router = APIRouter(prefix="/api/sites", tags=["sites"])
 
@@ -68,3 +71,57 @@ async def upload_site(
     enqueue_provision(background_tasks, settings, site_id, user_id, target)
 
     return {"siteId": site_id, "status": STATUS_UPLOADED}
+
+
+@router.delete("/{site_id}", status_code=status.HTTP_200_OK)
+async def delete_site(
+    site_id: str,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(current_user_id),
+    settings: Settings = Depends(get_settings),
+):
+    """Remove a site: drop the DB row immediately, then tear down CT + gateway
+    route + zip asynchronously. UI sees the row vanish instantly; the heavy
+    work happens in the background.
+    """
+    # Look up before delete so we can pass subdomain/zip path to the teardown.
+    # `.eq("user_id", user_id)` enforces ownership at the API layer in addition
+    # to whatever RLS does in Postgres — defense in depth.
+    rows = (
+        admin_client()
+        .table("sites")
+        .select("id, user_id, subdomain, original_filename, name")
+        .eq("id", site_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if not rows:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "site not found")
+    site = rows[0]
+
+    # Reconstruct the zip path the upload endpoint wrote to. We don't store
+    # the absolute path in the DB, but the layout is deterministic.
+    slug = slugify(Path(site.get("original_filename") or site.get("name") or "site").stem)
+    try:
+        zip_path = site_zip_path(settings.storage_root, user_id, site_id, display_name=slug)
+    except Exception:
+        log.exception("could not derive zip path for site_id=%s; teardown will skip the file", site_id)
+        zip_path = None
+
+    # Delete the row first so the dashboard reflects the action immediately.
+    # If teardown later fails, we'll have an orphan CT — preferable to leaving
+    # the row in a "deleting" limbo when the user clicked a destructive button.
+    admin_client().table("sites").delete().eq("id", site_id).eq("user_id", user_id).execute()
+
+    enqueue_teardown(
+        background_tasks,
+        settings,
+        site_id,
+        site.get("subdomain"),
+        zip_path,
+    )
+
+    return {"siteId": site_id, "status": "deleting"}

@@ -8,6 +8,16 @@
     name: caddy
     state: reloaded
 
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: restart caddy
+  ansible.builtin.systemd:
+    name: caddy
+    state: restarted
+    daemon_reload: true
+
 - name: reload nftables
   ansible.builtin.systemd:
     name: nftables

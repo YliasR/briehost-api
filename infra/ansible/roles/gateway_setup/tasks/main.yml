@@ -100,11 +100,34 @@
     validate: "caddy validate --config %s"
   notify: reload caddy
 
+# Run Caddy with --resume so dynamic routes pushed via the admin API survive
+# restarts. Caddy auto-writes /var/lib/caddy/.config/caddy/autosave.json on
+# every admin-API mutation; --resume reloads that on start, falling back to
+# --config (the static Caddyfile) only on first boot when no autosave exists.
+- name: Ensure systemd drop-in dir for caddy
+  ansible.builtin.file:
+    path: /etc/systemd/system/caddy.service.d
+    state: directory
+    mode: "0755"
+
+- name: Configure caddy to start with --resume (persist dynamic routes)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/caddy.service.d/resume.conf
+    mode: "0644"
+    content: |
+      [Service]
+      ExecStart=
+      ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile --resume
+  notify:
+    - reload systemd
+    - restart caddy
+
 - name: Ensure caddy is enabled + running
   ansible.builtin.systemd:
     name: caddy
     enabled: true
     state: started
+    daemon_reload: true
 
 # --- nftables (lock admin API to the API CT only) -------------------------
 

@@ -30,6 +30,9 @@ class Settings:
     ansible_playbook_path: str = os.getenv(
         "ANSIBLE_PLAYBOOK_PATH", "infra/ansible/playbooks/provision_site.yml"
     )
+    ansible_delete_playbook_path: str = os.getenv(
+        "ANSIBLE_DELETE_PLAYBOOK_PATH", "infra/ansible/playbooks/delete_site.yml"
+    )
     ansible_inventory_path: str = os.getenv(
         "ANSIBLE_INVENTORY_PATH", "infra/ansible/inventory/production.ini"
     )

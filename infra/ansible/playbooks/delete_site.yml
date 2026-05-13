@@ -1,0 +1,20 @@
+---
+# Tear down a tenant CT for a given site_id. Reuses proxmox_cleanup, which
+# already locates any CT tagged `site_id=<uuid>` and runs pct stop + pct destroy.
+#
+# Required extra vars (passed by app/worker.py):
+#   site_id        UUID of the site row in Supabase
+
+- name: Delete tenant site
+  hosts: proxmox
+  gather_facts: false
+
+  pre_tasks:
+    - name: Validate required extra-vars
+      ansible.builtin.assert:
+        that:
+          - site_id is defined and site_id | length > 0
+        fail_msg: "Missing site_id"
+
+  roles:
+    - proxmox_cleanup

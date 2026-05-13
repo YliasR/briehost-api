@@ -19,7 +19,7 @@ from pathlib import Path
 
 from app.config import Settings
 from app.db import admin_client
-from app.gateway import derive_subdomain, register_route
+from app.gateway import derive_subdomain, register_route, unregister_route
 from app.scanner import MalwareDetected, ScanError, clamd_scan
 from app.storage import UnsafeZipError, validate_zip_policy
 
@@ -353,3 +353,84 @@ def enqueue_provision(
 ) -> None:
     """Single seam for swapping in Celery/RQ later. Today: FastAPI BackgroundTasks."""
     background_tasks.add_task(provision_site, settings, site_id, user_id, zip_path)
+
+
+def _run_delete_playbook(settings: Settings, site_id: str) -> tuple[int, str, str]:
+    """Run the delete playbook (proxmox_cleanup) for a single site_id."""
+    extra_vars: dict[str, object] = {"site_id": site_id}
+    try:
+        extra_vars.update(json.loads(settings.ansible_extra_vars_json or "{}"))
+    except json.JSONDecodeError:
+        # already validated on the provisioning path; ignore here so a malformed
+        # extra-vars JSON doesn't block deletes.
+        pass
+
+    cmd = [
+        "ansible-playbook",
+        settings.ansible_delete_playbook_path,
+        "-i",
+        settings.ansible_inventory_path,
+        "-e",
+        json.dumps(extra_vars),
+    ]
+    log.info("running: %s", " ".join(shlex.quote(c) for c in cmd))
+    proc = subprocess.run(
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=settings.ansible_timeout_seconds,
+    )
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def teardown_site(
+    settings: Settings,
+    site_id: str,
+    subdomain: str | None,
+    zip_path: Path | None,
+) -> None:
+    """Best-effort tenant teardown: gateway route, LXC, on-disk zip.
+
+    Designed to be called from a background task after the API has already
+    removed the DB row (so the dashboard reflects the delete instantly). Each
+    step is logged but never raised — there's no row to mark "failed" on
+    anymore, so failures here just become orphans for ops to clean up.
+    """
+    if subdomain:
+        try:
+            unregister_route(settings, subdomain)
+        except Exception:
+            log.exception("gateway unregister failed for site_id=%s subdomain=%s", site_id, subdomain)
+
+    if zip_path:
+        try:
+            Path(zip_path).unlink(missing_ok=True)
+        except Exception:
+            log.exception("zip cleanup failed for site_id=%s path=%s", site_id, zip_path)
+
+    try:
+        # Serialize against concurrent provisioning to avoid pct races.
+        with _provision_lock:
+            rc, stdout, stderr = _run_delete_playbook(settings, site_id)
+        if rc != 0:
+            log.error(
+                "delete playbook failed for site_id=%s rc=%s tail=%s",
+                site_id,
+                rc,
+                (stderr or stdout)[-_TRIM:],
+            )
+    except subprocess.TimeoutExpired:
+        log.exception("delete playbook timed out for site_id=%s", site_id)
+    except Exception:
+        log.exception("delete playbook crashed for site_id=%s", site_id)
+
+
+def enqueue_teardown(
+    background_tasks,
+    settings: Settings,
+    site_id: str,
+    subdomain: str | None,
+    zip_path: Path | None,
+) -> None:
+    background_tasks.add_task(teardown_site, settings, site_id, subdomain, zip_path)
