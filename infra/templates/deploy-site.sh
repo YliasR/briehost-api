@@ -17,7 +17,24 @@ set -euo pipefail
 ZIP_FILE="${1:-}"
 WEB_ROOT="/var/www/html"
 WEB_USER="www-data"
-NGINX_VHOST="/etc/nginx/sites-available/default"
+
+# Discover the vhost nginx actually has enabled. The golden template ships with
+# `sites-enabled/site.conf` (not `default`), so hard-coding `default` writes a
+# file nginx never reads. Follow whichever symlink is live; fall back to
+# `default` only if nothing is enabled.
+NGINX_VHOST=""
+for link in /etc/nginx/sites-enabled/*; do
+    [[ -L "$link" ]] || continue
+    target="$(readlink -f "$link")"
+    if [[ -n "$target" ]]; then
+        NGINX_VHOST="$target"
+        break
+    fi
+done
+if [[ -z "$NGINX_VHOST" ]]; then
+    NGINX_VHOST="/etc/nginx/sites-available/default"
+    ln -sf "$NGINX_VHOST" /etc/nginx/sites-enabled/default
+fi
 
 # php-fpm socket varies by PHP version; pick whatever the template ships.
 PHP_FPM_SOCK="$(ls /run/php/php*-fpm.sock 2>/dev/null | head -1)"
