@@ -13,9 +13,15 @@ half-finished gateway later.
   1. **Card / Bancontact** via Stripe (Belgian jury sees Bancontact, recognises it instantly).
   2. **PayPal** (recognisable button, sandbox accounts are free).
   3. **Crypto** via CoinGate (EU-licensed, has a sandbox).
-- A deliberate, documented dark-pattern "continue with free tier" link so we can
+- A deliberate, documented dark-pattern **skip-payment** link so we can
   write up the ethical framing in the report — that's worth as many points
-  as the integration itself.
+  as the integration itself. **The skip does NOT downgrade the user to
+  the free tier** — they get whatever plan they picked, just without
+  paying. The dark pattern is "make it hard to find the free-actually
+  path," not "trick them into a worse plan." This distinction matters
+  both for the ethical write-up (it's more egregious — closer to actual
+  fraud-via-UX than mere upsell) and for testing, since we can exercise
+  every plan tier without juggling real sandbox charges.
 
 ## Non-goals
 
@@ -124,7 +130,7 @@ New table:
 
 ```sql
 CREATE TYPE payment_status AS ENUM ('pending', 'succeeded', 'failed', 'cancelled');
-CREATE TYPE payment_provider AS ENUM ('stripe', 'paypal', 'coingate');
+CREATE TYPE payment_provider AS ENUM ('stripe', 'paypal', 'coingate', 'skip');
 
 CREATE TABLE public.payment_intents (
   id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -154,10 +160,21 @@ the existing `updatePlan` path after marking the intent `succeeded`.
 ```
 POST  /api/payments/intents          { planId, provider } → { checkoutUrl, intentId }
 GET   /api/payments/intents/{id}                          → { status, ... }   # for polling fallback
+POST  /api/payments/skip             { planId }           → { plan }           # dark-pattern skip
 POST  /api/payments/stripe/webhook                        → 200 / 4xx          # signed
 POST  /api/payments/paypal/webhook                        → 200 / 4xx          # signed
 POST  /api/payments/coingate/webhook                      → 200 / 4xx          # signed
 ```
+
+`POST /api/payments/skip` is the server side of the dark-pattern skip:
+it updates `profiles.plan` to the requested plan (any tier) without any
+payment intent, and writes a `payment_intents` row with
+`provider='skip'`, `status='succeeded'`, `amount_cents=0` for audit
+purposes. Having a real route (rather than letting the frontend call
+`updatePlan` directly) means every plan upgrade — paid or skipped —
+goes through a single audited code path. Important for the write-up:
+the route exists in the codebase, which is itself evidence of the
+deliberate design choice.
 
 All three webhooks verify a provider signature before doing anything
 (Stripe: `Stripe-Signature` HMAC, PayPal: certificate-based, CoinGate:
@@ -198,23 +215,49 @@ This is the bit that becomes a written section in the report, framed as
 a *deliberate demonstration* of UX manipulation patterns we then critique.
 Implement it. Don't hide it. Talk about it.
 
-Concrete pattern stack on the upgrade page:
+**Key design decision:** the skip path activates *whatever plan the user
+selected*, with no payment, no downgrade. Picked the €99 Enterprise
+tier? Hit skip → you get Enterprise for free. The dark pattern is making
+that path *visually invisible*, not redirecting the user to a worse
+plan. This is more egregious than a typical upsell pattern, which is
+exactly why it's interesting to write about.
 
-1. **Pre-selected plan** — middle tier is selected by default on render.
+It also makes testing painless: every plan tier can be exercised end
+to end via the skip without juggling sandbox charges. The QA flow
+becomes "pick plan → click checkout (test card) → done" or "pick plan
+→ skip → done."
+
+Concrete pattern stack on the payment-method screen (the screen *after*
+plan selection, before the actual checkout redirect):
+
+1. **Pre-selected payment method** — Stripe card is highlighted by
+   default; user has to actively choose another or actively choose to
+   skip.
 2. **Visual hierarchy** — big yellow "Continue to checkout 🧀" button,
-   small grey "continue with free tier" *link* (not a button) underneath.
-3. **Loss-aversion copy** on the skip path: "Are you sure? Free tier users
-   only get crumbs 🥲 — you'll lose access to [list of features]."
-4. **Friction asymmetry** — paying is one click, skipping is one click +
-   one modal confirm.
-5. **Confirm-shaming** modal buttons: primary "Take me back" vs ghost
-   "Continue with crumbs anyway".
+   small grey *text link* "continue without paying" underneath. Not a
+   button. No icon. Muted-foreground colour. Easy to miss.
+3. **Confirm-shame modal** on the skip click. Title: "Wait, really?".
+   Body lists the features the user is *not* actually losing (since
+   they get the plan anyway) but frames it as loss: "Most users on the
+   [Plan Name] tier prefer to keep their account in good standing..."
+   etc. Buttons: primary "Take me back" / ghost "Continue without
+   paying anyway 🥲".
+4. **Friction asymmetry** — paying is one click → redirect. Skipping is
+   one click → modal → confirm.
+5. **Naming** — every component involved is named after the pattern it
+   implements (`SkipConfirmShameModal`, `MutedSkipLink`). When the jury
+   opens the source, the names tell on us.
 
-Report angle: list each pattern, name it (it's all named in the
-[deceptive.design](https://www.deceptive.design/) taxonomy), explain why
-it works, explain why we'd remove it for a real shipping product, and
-cite the EU [Digital Services Act](https://digital-strategy.ec.europa.eu/en/policies/digital-services-act-package)
-provisions on dark patterns. Jury bait.
+Report angle: list each pattern, name it (all named in the
+[deceptive.design](https://www.deceptive.design/) taxonomy), explain
+why it works psychologically, explain why we'd remove it from a real
+shipping product, and cite the EU
+[Digital Services Act](https://digital-strategy.ec.europa.eu/en/policies/digital-services-act-package)
+provisions on dark patterns (Article 25 specifically prohibits
+deceptive designs that "materially distort" user decisions). The
+egregiousness lives in the fact that the skip *grants the paid
+benefit* without payment — which would be straightforward consumer
+fraud if shipped. Jury bait.
 
 ## Frontend changes (brieblast-landing)
 
