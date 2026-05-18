@@ -13,6 +13,6 @@
     # API worker (POST /config/apps/http/servers/srv0/routes/0). Anything
     # that falls through here is an unknown subdomain.
     handle {
-        respond "Brieblast gateway: unknown host" 404
+        redir https://briehosting.be/sitenotfound?site={host} 302
     }
 }
