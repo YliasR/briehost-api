@@ -3,11 +3,12 @@ import logging
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, HTTPException, UploadFile, status
 
 from app.auth import current_user_id
 from app.config import Settings, get_settings
 from app.db import admin_client
+from app.gateway import derive_subdomain
 from app.storage import site_zip_path, slugify
 from app.worker import STATUS_UPLOADED, enqueue_provision, enqueue_teardown, inflight_count
 
@@ -18,21 +19,12 @@ router = APIRouter(prefix="/api/sites", tags=["sites"])
 
 @router.post("/upload")
 async def upload_site(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     user_id: str = Depends(current_user_id),
     settings: Settings = Depends(get_settings),
 ):
     if not file.filename or not file.filename.lower().endswith(".zip"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "File must be a .zip")
-
-    # Backpressure: in-process provisioning runs in BackgroundTasks; reject early
-    # when at capacity instead of letting threads pile up. Real fix is a queue.
-    if inflight_count() >= settings.max_concurrent_provisions:
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Provisioning capacity reached, retry shortly",
-        )
 
     site_id = str(uuid.uuid4())
     name = Path(file.filename).stem or "site"
@@ -57,6 +49,11 @@ async def upload_site(
             "Failed to store uploaded file",
         ) from exc
 
+    # Suggest a default subdomain from the filename so the UI can prefill it,
+    # but don't claim it yet — that happens at /provision time after the user
+    # confirms (and possibly edits) the name.
+    suggested_subdomain = derive_subdomain(slug)
+
     admin_client().table("sites").insert(
         {
             "id": site_id,
@@ -68,9 +65,91 @@ async def upload_site(
         }
     ).execute()
 
-    enqueue_provision(background_tasks, settings, site_id, user_id, target)
+    return {
+        "siteId": site_id,
+        "status": STATUS_UPLOADED,
+        "suggestedSubdomain": suggested_subdomain,
+    }
 
-    return {"siteId": site_id, "status": STATUS_UPLOADED}
+
+@router.post("/{site_id}/provision")
+async def provision_uploaded_site(
+    site_id: str,
+    background_tasks: BackgroundTasks,
+    payload: dict = Body(...),
+    user_id: str = Depends(current_user_id),
+    settings: Settings = Depends(get_settings),
+):
+    """Kick off provisioning for a previously-uploaded site under the chosen subdomain."""
+    raw_subdomain = (payload.get("subdomain") or "").strip()
+    if not raw_subdomain:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "subdomain is required")
+
+    subdomain = derive_subdomain(raw_subdomain)
+    if not subdomain:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "subdomain must contain at least one letter or digit",
+        )
+
+    rows = (
+        admin_client()
+        .table("sites")
+        .select("id, user_id, status, original_filename, name")
+        .eq("id", site_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if not rows:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "site not found")
+    site = rows[0]
+
+    if site.get("status") != STATUS_UPLOADED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"site is not awaiting provisioning (status={site.get('status')})",
+        )
+
+    # Backpressure: in-process provisioning runs in BackgroundTasks; reject early
+    # when at capacity instead of letting threads pile up. Real fix is a queue.
+    if inflight_count() >= settings.max_concurrent_provisions:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Provisioning capacity reached, retry shortly",
+        )
+
+    # Subdomains live in a single global namespace (see sql/004); check before
+    # we kick off the worker so the user gets an actionable 409 rather than a
+    # silent failure later.
+    taken = (
+        admin_client()
+        .table("sites")
+        .select("id")
+        .eq("subdomain", subdomain)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if taken:
+        raise HTTPException(status.HTTP_409_CONFLICT, "subdomain is already taken")
+
+    # Claim the subdomain on the row before enqueueing so concurrent /provision
+    # calls collide on the unique index instead of racing the worker.
+    try:
+        admin_client().table("sites").update({"subdomain": subdomain}).eq("id", site_id).execute()
+    except Exception as exc:  # likely unique-index collision
+        raise HTTPException(status.HTTP_409_CONFLICT, "subdomain is already taken") from exc
+
+    slug = slugify(Path(site.get("original_filename") or site.get("name") or "site").stem)
+    zip_path = site_zip_path(settings.storage_root, user_id, site_id, display_name=slug)
+
+    enqueue_provision(background_tasks, settings, site_id, user_id, zip_path, subdomain)
+
+    return {"siteId": site_id, "status": STATUS_UPLOADED, "subdomain": subdomain}
 
 
 @router.delete("/{site_id}", status_code=status.HTTP_200_OK)
