@@ -192,6 +192,36 @@ ENV
         echo "vendor/ already present in zip — skipping composer install."
     fi
 
+    # Build frontend assets if the project uses Vite (Laravel 9+ default).
+    # The Blade @vite() directive crashes at render time with a 500
+    # "Vite manifest not found" until public/build/manifest.json exists.
+    # Skip the build entirely if the user already shipped public/build/
+    # (smart move on their end — saves us a node_modules install).
+    if [[ -f "$WEB_ROOT/package.json" ]] \
+       && ls "$WEB_ROOT"/vite.config.* >/dev/null 2>&1 \
+       && [[ ! -f "$WEB_ROOT/public/build/manifest.json" ]]; then
+        echo "Vite project detected — building frontend assets."
+        # npm ci is reproducible (uses package-lock.json) but only works when
+        # the lockfile is present; fall back to install otherwise. Both as
+        # www-data so any cached artifacts in node_modules land with the
+        # right owner.
+        if [[ -f "$WEB_ROOT/package-lock.json" ]]; then
+            runuser -u "$WEB_USER" -- \
+                npm --prefix "$WEB_ROOT" ci --no-audit --no-fund --loglevel=error \
+                || echo "WARNING: npm ci failed; frontend assets may be missing." >&2
+        else
+            runuser -u "$WEB_USER" -- \
+                npm --prefix "$WEB_ROOT" install --no-audit --no-fund --loglevel=error \
+                || echo "WARNING: npm install failed; frontend assets may be missing." >&2
+        fi
+        runuser -u "$WEB_USER" -- \
+            npm --prefix "$WEB_ROOT" run build --silent \
+            || echo "WARNING: npm run build failed; @vite() will throw at runtime." >&2
+
+        # node_modules is huge and pointless at runtime — drop it after build.
+        rm -rf "$WEB_ROOT/node_modules"
+    fi
+
     # APP_KEY: required for sessions/encryption. Generate only if missing.
     if [[ -f "$WEB_ROOT/.env" ]] && ! grep -qE '^APP_KEY=base64:' "$WEB_ROOT/.env"; then
         runuser -u "$WEB_USER" -- \
