@@ -1,8 +1,9 @@
 """Clone a public Git repository and pack it into a site zip.
 
-Phase 1: only public HTTPS GitHub URLs. Private repos / other hosts would
-need credential storage (App or per-user PAT) and a broader allowlist —
-deliberately out of scope here.
+Phase 1: public HTTPS URLs only, from an allowlisted set of hosts
+(GitHub, GitLab, git.gay). All three use the same `<host>/<owner>/<repo>`
+URL pattern, so a single normalizer handles them. Private repos would
+need credential storage (App / PAT) — deliberately out of scope here.
 
 The output zip has the same shape and on-disk path as a user-uploaded
 zip, so the existing scan + provision pipeline can consume it unchanged.
@@ -26,7 +27,13 @@ class RepoCloneError(ValueError):
     """Raised for any validation / clone / packaging failure surfaced to the user."""
 
 
-_ALLOWED_HOSTS = {"github.com"}
+# Hosts we'll clone from. Forgejo/Gitea (git.gay) and GitLab both expose the
+# same `https://<host>/<owner>/<repo>(.git)` URL shape as GitHub, so a single
+# normalizer is enough. GitLab nested groups
+# (`gitlab.com/group/subgroup/repo`) aren't supported in this pass — the first
+# two path segments are treated as owner/repo. Users with deeper nesting can
+# either move the project or wait for Phase 2.
+_ALLOWED_HOSTS = {"github.com", "gitlab.com", "git.gay"}
 # Conservative: owner / repo segments are alnum + `-`, `_`, `.`. Anything else
 # is either a route segment (issues/, pulls/) or a typo — reject early.
 _SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -37,16 +44,17 @@ _BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 
 @dataclass
 class ClonedRepo:
+    host: str
     owner: str
     repo: str
     ref: str  # branch or "default"
     display_name: str  # for original_filename column
 
 
-def validate_repo_url(raw_url: str) -> tuple[str, str]:
-    """Validate a public GitHub URL and return (owner, repo). Raises RepoCloneError."""
-    owner, repo, _ = _normalize_github_url(raw_url)
-    return owner, repo
+def validate_repo_url(raw_url: str) -> tuple[str, str, str]:
+    """Validate a public repo URL and return (host, owner, repo). Raises RepoCloneError."""
+    host, owner, repo, _ = _normalize_repo_url(raw_url)
+    return host, owner, repo
 
 
 def validate_branch(branch: str | None) -> str | None:
@@ -54,8 +62,8 @@ def validate_branch(branch: str | None) -> str | None:
     return _validate_branch(branch)
 
 
-def _normalize_github_url(raw_url: str) -> tuple[str, str, str]:
-    """Validate + canonicalize a public GitHub URL. Returns (owner, repo, clone_url)."""
+def _normalize_repo_url(raw_url: str) -> tuple[str, str, str, str]:
+    """Validate + canonicalize a public repo URL. Returns (host, owner, repo, clone_url)."""
     if not raw_url or not isinstance(raw_url, str):
         raise RepoCloneError("repo URL is required")
 
@@ -70,13 +78,16 @@ def _normalize_github_url(raw_url: str) -> tuple[str, str, str]:
         raise RepoCloneError("credentials in the URL are not allowed")
     host = (parsed.hostname or "").lower()
     if host not in _ALLOWED_HOSTS:
-        raise RepoCloneError(f"only public GitHub repos are supported (host={host or 'missing'})")
+        allowed = ", ".join(sorted(_ALLOWED_HOSTS))
+        raise RepoCloneError(
+            f"unsupported host {host or 'missing'!r}; allowed: {allowed}"
+        )
     if parsed.port not in (None, 443):
         raise RepoCloneError("non-default ports are not allowed")
 
     segments = [s for s in parsed.path.split("/") if s]
     if len(segments) < 2:
-        raise RepoCloneError("URL must point at a repo, e.g. https://github.com/owner/repo")
+        raise RepoCloneError(f"URL must point at a repo, e.g. https://{host}/owner/repo")
     owner, repo = segments[0], segments[1]
     if repo.endswith(".git"):
         repo = repo[: -len(".git")]
@@ -85,8 +96,8 @@ def _normalize_github_url(raw_url: str) -> tuple[str, str, str]:
     if repo in {".", ".."}:
         raise RepoCloneError("invalid repository name")
 
-    clone_url = f"https://github.com/{owner}/{repo}.git"
-    return owner, repo, clone_url
+    clone_url = f"https://{host}/{owner}/{repo}.git"
+    return host, owner, repo, clone_url
 
 
 def _validate_branch(branch: str | None) -> str | None:
@@ -193,6 +204,7 @@ def _zip_tree(root: Path, target_zip: Path) -> int:
 
 def clone_and_pack(
     *,
+    host: str,
     owner: str,
     repo: str,
     branch: str | None,
@@ -201,18 +213,21 @@ def clone_and_pack(
     max_files: int,
     max_bytes: int,
 ) -> tuple[ClonedRepo, int]:
-    """Shallow-clone the given GitHub repo, enforce size limits, pack into `target_zip`.
+    """Shallow-clone the given repo, enforce size limits, pack into `target_zip`.
 
-    `owner`/`repo`/`branch` are assumed pre-validated (see validate_repo_url /
-    validate_branch). Returns the metadata + the on-disk zip size. Cleans up
-    the temp clone dir on every exit path. Caller is responsible for unlinking
-    `target_zip` if it later decides to roll back the upload row.
+    `host`/`owner`/`repo`/`branch` are assumed pre-validated (see
+    validate_repo_url / validate_branch). Returns the metadata + the on-disk
+    zip size. Cleans up the temp clone dir on every exit path. Caller is
+    responsible for unlinking `target_zip` if it later decides to roll back
+    the upload row.
     """
     # Re-validate even though the caller should have — defense in depth so this
     # function can't be misused with attacker-controlled values from another path.
+    if host not in _ALLOWED_HOSTS:
+        raise RepoCloneError(f"unsupported host {host!r}")
     if not _SEGMENT_RE.match(owner) or not _SEGMENT_RE.match(repo):
         raise RepoCloneError("invalid owner or repository name")
-    clone_url = f"https://github.com/{owner}/{repo}.git"
+    clone_url = f"https://{host}/{owner}/{repo}.git"
     cleaned_branch = _validate_branch(branch)
 
     with tempfile.TemporaryDirectory(prefix="briehost-clone-") as tmp:
@@ -243,6 +258,7 @@ def clone_and_pack(
 
     return (
         ClonedRepo(
+            host=host,
             owner=owner,
             repo=repo,
             ref=cleaned_branch or "default",

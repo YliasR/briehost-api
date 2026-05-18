@@ -95,7 +95,7 @@ async def upload_site_from_repo(
     # `validate_repo_url` is cheap and raises the same RepoCloneError that
     # clone_and_pack would, so error handling stays uniform.
     try:
-        owner, repo = validate_repo_url(repo_url)
+        host, owner, repo = validate_repo_url(repo_url)
         cleaned_branch = validate_branch(branch)
     except RepoCloneError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
@@ -106,6 +106,7 @@ async def upload_site_from_repo(
 
     try:
         meta, written = clone_and_pack(
+            host=host,
             owner=owner,
             repo=repo,
             branch=cleaned_branch,
