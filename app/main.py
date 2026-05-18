@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 from app.routes import sites
 from app.sync_gateway import resync as resync_gateway
+from app.worker import start_consumer, stop_consumer
 
 log = logging.getLogger("briehost.main")
 
@@ -31,6 +32,18 @@ def _resync_gateway_on_boot() -> None:
         resync_gateway(settings)
     except Exception:
         log.exception("gateway resync on startup failed; continuing")
+
+
+@app.on_event("startup")
+async def _start_provision_consumer() -> None:
+    # Single FIFO consumer for provision + teardown jobs. Must be created
+    # inside the event loop, so this is async and lives in startup.
+    await start_consumer(settings)
+
+
+@app.on_event("shutdown")
+async def _stop_provision_consumer() -> None:
+    await stop_consumer()
 
 
 @app.get("/healthz")

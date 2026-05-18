@@ -3,7 +3,7 @@ import logging
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status
 
 from app.auth import current_user_id
 from app.config import Settings, get_settings
@@ -11,7 +11,7 @@ from app.db import admin_client
 from app.gateway import derive_subdomain
 from app.repo import RepoCloneError, clone_and_pack, validate_branch, validate_repo_url
 from app.storage import site_zip_path, slugify
-from app.worker import STATUS_UPLOADED, enqueue_provision, enqueue_teardown, inflight_count
+from app.worker import STATUS_QUEUED, STATUS_UPLOADED, enqueue_provision, enqueue_teardown, queue_depth
 
 log = logging.getLogger("briehost.routes.sites")
 
@@ -159,7 +159,6 @@ async def upload_site_from_repo(
 @router.post("/{site_id}/provision")
 async def provision_uploaded_site(
     site_id: str,
-    background_tasks: BackgroundTasks,
     payload: dict = Body(...),
     user_id: str = Depends(current_user_id),
     settings: Settings = Depends(get_settings),
@@ -197,12 +196,14 @@ async def provision_uploaded_site(
             f"site is not awaiting provisioning (status={site.get('status')})",
         )
 
-    # Backpressure: in-process provisioning runs in BackgroundTasks; reject early
-    # when at capacity instead of letting threads pile up. Real fix is a queue.
-    if inflight_count() >= settings.max_concurrent_provisions:
+    # Backpressure: queue depth includes the currently-running job + everything
+    # waiting. Reject when the queue is full so users get a 503 instead of
+    # piling up an unbounded backlog. The setting name is legacy ("concurrent")
+    # but its meaning is now "max queue depth".
+    if queue_depth() >= settings.max_concurrent_provisions:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Provisioning capacity reached, retry shortly",
+            "Provisioning queue is full, retry shortly",
         )
 
     # Subdomains live in a single global namespace (see sql/004); check before
@@ -231,15 +232,14 @@ async def provision_uploaded_site(
     slug = slugify(Path(site.get("original_filename") or site.get("name") or "site").stem)
     zip_path = site_zip_path(settings.storage_root, user_id, site_id, display_name=slug)
 
-    enqueue_provision(background_tasks, settings, site_id, user_id, zip_path, subdomain)
+    enqueue_provision(settings, site_id, user_id, zip_path, subdomain)
 
-    return {"siteId": site_id, "status": STATUS_UPLOADED, "subdomain": subdomain}
+    return {"siteId": site_id, "status": STATUS_QUEUED, "subdomain": subdomain}
 
 
 @router.delete("/{site_id}", status_code=status.HTTP_200_OK)
 async def delete_site(
     site_id: str,
-    background_tasks: BackgroundTasks,
     user_id: str = Depends(current_user_id),
     settings: Settings = Depends(get_settings),
 ):
@@ -280,7 +280,6 @@ async def delete_site(
     admin_client().table("sites").delete().eq("id", site_id).eq("user_id", user_id).execute()
 
     enqueue_teardown(
-        background_tasks,
         settings,
         site_id,
         site.get("subdomain"),
