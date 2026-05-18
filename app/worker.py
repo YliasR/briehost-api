@@ -1,11 +1,19 @@
 """Background provisioning worker.
 
-Runs the scan -> ansible-playbook pipeline and writes status transitions to Supabase.
-Invoked via FastAPI BackgroundTasks for now; can be moved to Celery/RQ/Arq later
-without touching the route layer (see `enqueue_provision`).
+Single-consumer asyncio queue. Provision and teardown jobs are FIFO-serialized
+through one consumer so concurrent uploads can't race Proxmox (`pvesh get
+/cluster/nextid` is informational and the LVM-thin template lock serializes
+storage-side anyway). The consumer runs the sync pipeline in a thread executor
+so it doesn't block the FastAPI event loop.
+
+Compared to the previous threading.Lock + BackgroundTasks setup, jobs that are
+waiting their turn now sit on status='queued' instead of pretending to be
+provisioning — the UI can show queue position and the system stops looking
+frozen to the second/third user.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -13,9 +21,10 @@ import shlex
 import subprocess
 import shutil
 import tempfile
-import threading
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from app.config import Settings
 from app.db import admin_client
@@ -27,6 +36,7 @@ log = logging.getLogger("briehost.worker")
 
 # Status vocabulary, mirrored in ANSIBLE_PROVISIONING_APPROACH.md
 STATUS_UPLOADED = "uploaded"
+STATUS_QUEUED = "queued"
 STATUS_SCANNING = "scanning"
 STATUS_SCAN_FAILED = "scan_failed"
 STATUS_PROVISIONING = "provisioning"
@@ -37,39 +47,123 @@ SUPPORTED_BACKENDS = {"ansible"}
 
 _TRIM = 4000  # cap for stderr/stdout we persist
 
-# In-process gauge of provisions currently running. Used by the route as
-# crude backpressure (reject new uploads at capacity). Not durable across
-# restarts — proper backpressure belongs in a real job queue.
-_inflight_lock = threading.Lock()
-_inflight = 0
 
-# Serializes the ansible-playbook call across concurrent uploads. Proxmox
-# clone+config operations race on two fronts:
-#   1. `pvesh get /cluster/nextid` is informational, so two concurrent runs
-#      can get the same VMID and the second clone fails (403 or "exists").
-#   2. Full clones from the same LVM-thin template hit a storage-level lock
-#      and one of the parallel runs gets "got lock timeout" (HTTP 500).
-# Holding this lock means scan/validate still run in parallel; only the
-# Proxmox interaction serializes. This is the bottleneck anyway.
-_provision_lock = threading.Lock()
+# --- queue plumbing -------------------------------------------------------
+
+JobKind = Literal["provision", "teardown"]
 
 
-def inflight_count() -> int:
-    with _inflight_lock:
-        return _inflight
+@dataclass(frozen=True)
+class ProvisionJob:
+    kind: Literal["provision"]
+    site_id: str
+    user_id: str
+    zip_path: Path
+    subdomain: str
 
 
-def _inflight_inc() -> None:
-    global _inflight
-    with _inflight_lock:
-        _inflight += 1
+@dataclass(frozen=True)
+class TeardownJob:
+    kind: Literal["teardown"]
+    site_id: str
+    subdomain: str | None
+    zip_path: Path | None
 
 
-def _inflight_dec() -> None:
-    global _inflight
-    with _inflight_lock:
-        _inflight = max(0, _inflight - 1)
+Job = ProvisionJob | TeardownJob
 
+# Initialized in start_consumer() (needs to bind to the running event loop).
+_queue: asyncio.Queue[Job | None] | None = None
+_consumer_task: asyncio.Task | None = None
+_running_site_id: str | None = None  # id of the job currently executing, None if idle
+
+
+def queue_depth() -> int:
+    """Pending + running jobs. Used as backpressure by the route layer."""
+    pending = _queue.qsize() if _queue is not None else 0
+    running = 1 if _running_site_id is not None else 0
+    return pending + running
+
+
+def queued_site_ids() -> list[str]:
+    """Snapshot of site_ids currently waiting in the queue, in FIFO order.
+
+    Used to compute queue position for the UI. asyncio.Queue exposes the
+    internal deque as `._queue`; we read it without mutating.
+    """
+    if _queue is None:
+        return []
+    snapshot = list(_queue._queue)  # type: ignore[attr-defined]
+    return [j.site_id for j in snapshot if isinstance(j, ProvisionJob)]
+
+
+async def start_consumer(settings: Settings) -> None:
+    """Call from FastAPI startup. Idempotent."""
+    global _queue, _consumer_task
+    if _consumer_task is not None and not _consumer_task.done():
+        return
+    _queue = asyncio.Queue()
+    _consumer_task = asyncio.create_task(_consumer_loop(settings), name="provision-consumer")
+    log.info("provision consumer started")
+
+
+async def stop_consumer() -> None:
+    """Call from FastAPI shutdown. Drains the consumer cleanly via sentinel."""
+    global _queue, _consumer_task
+    if _consumer_task is None:
+        return
+    if _queue is not None:
+        await _queue.put(None)  # sentinel; consumer exits after this
+    try:
+        await asyncio.wait_for(_consumer_task, timeout=5)
+    except asyncio.TimeoutError:
+        log.warning("consumer did not exit in time; cancelling")
+        _consumer_task.cancel()
+    _consumer_task = None
+    _queue = None
+
+
+async def _consumer_loop(settings: Settings) -> None:
+    """Single FIFO consumer. Runs each sync job in a thread executor so the
+    long-running subprocess.run calls don't block other API requests."""
+    global _running_site_id
+    assert _queue is not None
+    loop = asyncio.get_running_loop()
+    while True:
+        job = await _queue.get()
+        try:
+            if job is None:  # shutdown sentinel
+                return
+            _running_site_id = job.site_id
+            try:
+                if isinstance(job, ProvisionJob):
+                    await loop.run_in_executor(
+                        None,
+                        _provision_site_sync,
+                        settings,
+                        job.site_id,
+                        job.user_id,
+                        job.zip_path,
+                        job.subdomain,
+                    )
+                else:
+                    await loop.run_in_executor(
+                        None,
+                        _teardown_site_sync,
+                        settings,
+                        job.site_id,
+                        job.subdomain,
+                        job.zip_path,
+                    )
+            except Exception:
+                log.exception("consumer crashed on job site_id=%s", job.site_id)
+            finally:
+                _running_site_id = None
+        finally:
+            _queue.task_done()
+
+
+# --- regex + status helpers ----------------------------------------------
 
 # Healthcheck role emits: "BRIEHOST_RESULT site_id=... vmid=... ip=... hostname=... status=live"
 _RESULT_RE = re.compile(r"BRIEHOST_RESULT\s+(?P<kv>[^\"]+?)(?:\\n|\"|$)")
@@ -217,19 +311,19 @@ def _scan_with_php_malware_finder(settings: Settings, zip_path: Path) -> None:
             raise ScanError(stderr[:_TRIM] or f"php-malware-finder exited with rc={proc.returncode}")
 
 
-def provision_site(
+# --- sync job bodies (executed off the event loop) ------------------------
+
+
+def _provision_site_sync(
     settings: Settings,
     site_id: str,
     user_id: str,
     zip_path: Path,
     subdomain: str,
 ) -> None:
-    """Full pipeline for one upload. Safe to run as a fire-and-forget task.
-
-    `subdomain` is chosen at /provision time and already claimed on the row,
-    so the worker just uses it for the gateway push.
-    """
-    _inflight_inc()
+    """Full pipeline for one upload. Runs on a thread executor so the calling
+    asyncio consumer stays responsive — but the consumer awaits this, so only
+    one provision pipeline executes at a time."""
     try:
         if settings.provisioner_backend not in SUPPORTED_BACKENDS:
             _set_status(
@@ -286,8 +380,7 @@ def provision_site(
         _set_status(site_id, STATUS_PROVISIONING)
 
         try:
-            with _provision_lock:
-                rc, stdout, stderr = _run_ansible(settings, site_id, user_id, zip_path)
+            rc, stdout, stderr = _run_ansible(settings, site_id, user_id, zip_path)
         except subprocess.TimeoutExpired as exc:
             _set_status(
                 site_id,
@@ -334,20 +427,6 @@ def provision_site(
     except Exception as exc:  # noqa: BLE001 — last-resort guard so worker never crashes silently
         log.exception("provisioning crashed for site_id=%s", site_id)
         _set_status_safe(site_id, STATUS_FAILED, f"worker crash: {exc}")
-    finally:
-        _inflight_dec()
-
-
-def enqueue_provision(
-    background_tasks,  # fastapi.BackgroundTasks
-    settings: Settings,
-    site_id: str,
-    user_id: str,
-    zip_path: Path,
-    subdomain: str,
-) -> None:
-    """Single seam for swapping in Celery/RQ later. Today: FastAPI BackgroundTasks."""
-    background_tasks.add_task(provision_site, settings, site_id, user_id, zip_path, subdomain)
 
 
 def _run_delete_playbook(settings: Settings, site_id: str) -> tuple[int, str, str]:
@@ -379,7 +458,7 @@ def _run_delete_playbook(settings: Settings, site_id: str) -> tuple[int, str, st
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
-def teardown_site(
+def _teardown_site_sync(
     settings: Settings,
     site_id: str,
     subdomain: str | None,
@@ -387,10 +466,10 @@ def teardown_site(
 ) -> None:
     """Best-effort tenant teardown: gateway route, LXC, on-disk zip.
 
-    Designed to be called from a background task after the API has already
-    removed the DB row (so the dashboard reflects the delete instantly). Each
-    step is logged but never raised — there's no row to mark "failed" on
-    anymore, so failures here just become orphans for ops to clean up.
+    Called by the consumer after the API has already removed the DB row (so
+    the dashboard reflects the delete instantly). Each step is logged but
+    never raised — there's no row to mark "failed" on anymore, so failures
+    here just become orphans for ops to clean up.
     """
     if subdomain:
         try:
@@ -405,9 +484,7 @@ def teardown_site(
             log.exception("zip cleanup failed for site_id=%s path=%s", site_id, zip_path)
 
     try:
-        # Serialize against concurrent provisioning to avoid pct races.
-        with _provision_lock:
-            rc, stdout, stderr = _run_delete_playbook(settings, site_id)
+        rc, stdout, stderr = _run_delete_playbook(settings, site_id)
         if rc != 0:
             log.error(
                 "delete playbook failed for site_id=%s rc=%s tail=%s",
@@ -421,11 +498,54 @@ def teardown_site(
         log.exception("delete playbook crashed for site_id=%s", site_id)
 
 
+# --- public enqueue API (called from routes) ------------------------------
+
+
+def enqueue_provision(
+    settings: Settings,
+    site_id: str,
+    user_id: str,
+    zip_path: Path,
+    subdomain: str,
+) -> None:
+    """Add a provision job to the FIFO queue and mark the site as queued.
+
+    The status flip happens here (not inside the consumer) so the dashboard
+    immediately shows the row as 'queued' instead of sitting on 'uploaded'
+    until the consumer picks it up.
+    """
+    if _queue is None:
+        raise RuntimeError("provision consumer is not running; enqueue called before startup")
+    _set_status_safe(site_id, STATUS_QUEUED)
+    _queue.put_nowait(
+        ProvisionJob(
+            kind="provision",
+            site_id=site_id,
+            user_id=user_id,
+            zip_path=zip_path,
+            subdomain=subdomain,
+        )
+    )
+
+
 def enqueue_teardown(
-    background_tasks,
     settings: Settings,
     site_id: str,
     subdomain: str | None,
     zip_path: Path | None,
 ) -> None:
-    background_tasks.add_task(teardown_site, settings, site_id, subdomain, zip_path)
+    """Add a teardown job to the same FIFO queue as provisions.
+
+    Sharing the queue keeps the Proxmox `pct` interactions strictly serialized
+    so a delete can't race a provision through the storage-layer lock.
+    """
+    if _queue is None:
+        raise RuntimeError("provision consumer is not running; enqueue called before startup")
+    _queue.put_nowait(
+        TeardownJob(
+            kind="teardown",
+            site_id=site_id,
+            subdomain=subdomain,
+            zip_path=zip_path,
+        )
+    )
