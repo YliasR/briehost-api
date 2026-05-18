@@ -19,7 +19,7 @@ from pathlib import Path
 
 from app.config import Settings
 from app.db import admin_client
-from app.gateway import derive_subdomain, register_route, unregister_route
+from app.gateway import register_route, unregister_route
 from app.scanner import MalwareDetected, ScanError, clamd_scan
 from app.storage import UnsafeZipError, validate_zip_policy
 
@@ -217,8 +217,18 @@ def _scan_with_php_malware_finder(settings: Settings, zip_path: Path) -> None:
             raise ScanError(stderr[:_TRIM] or f"php-malware-finder exited with rc={proc.returncode}")
 
 
-def provision_site(settings: Settings, site_id: str, user_id: str, zip_path: Path) -> None:
-    """Full pipeline for one upload. Safe to run as a fire-and-forget task."""
+def provision_site(
+    settings: Settings,
+    site_id: str,
+    user_id: str,
+    zip_path: Path,
+    subdomain: str,
+) -> None:
+    """Full pipeline for one upload. Safe to run as a fire-and-forget task.
+
+    `subdomain` is chosen at /provision time and already claimed on the row,
+    so the worker just uses it for the gateway push.
+    """
     _inflight_inc()
     try:
         if settings.provisioner_backend not in SUPPORTED_BACKENDS:
@@ -307,30 +317,14 @@ def provision_site(settings: Settings, site_id: str, user_id: str, zip_path: Pat
                 except Exception:
                     log.exception("could not persist live extras for site_id=%s", site_id)
 
-            # Public subdomain assignment + gateway route push. Each is best-effort
-            # and persisted in its own UPDATE so a unique-constraint collision on
-            # subdomain doesn't lose the IP/VMID write above.
-            site_slug = zip_path.stem.removesuffix(f"-{site_id}") or "site"
-            subdomain = derive_subdomain(site_slug)
+            # Gateway route push. The subdomain was already claimed at /provision
+            # time, so we just need to point Caddy at the freshly-allocated IP.
             if subdomain and ip:
                 try:
                     register_route(settings, subdomain, ip)
                 except Exception:
                     log.exception(
                         "gateway route push failed for site_id=%s subdomain=%s",
-                        site_id,
-                        subdomain,
-                    )
-                try:
-                    admin_client().table("sites").update(
-                        {"subdomain": subdomain}
-                    ).eq("id", site_id).execute()
-                except Exception:
-                    # Most likely cause: unique-index collision with another tenant
-                    # already holding this slug. The site is still live; the user
-                    # can pick a different subdomain via the dashboard later.
-                    log.exception(
-                        "subdomain assign failed (collision?) for site_id=%s subdomain=%s",
                         site_id,
                         subdomain,
                     )
@@ -350,9 +344,10 @@ def enqueue_provision(
     site_id: str,
     user_id: str,
     zip_path: Path,
+    subdomain: str,
 ) -> None:
     """Single seam for swapping in Celery/RQ later. Today: FastAPI BackgroundTasks."""
-    background_tasks.add_task(provision_site, settings, site_id, user_id, zip_path)
+    background_tasks.add_task(provision_site, settings, site_id, user_id, zip_path, subdomain)
 
 
 def _run_delete_playbook(settings: Settings, site_id: str) -> tuple[int, str, str]:
