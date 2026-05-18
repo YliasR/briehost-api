@@ -78,6 +78,23 @@ class Settings:
     api_host: str = os.getenv("API_HOST", "0.0.0.0")
     api_port: int = int(os.getenv("API_PORT", "8000") or 8000)
 
+    # --- Payments (all sandbox / test mode). See docs/PAYMENTS.md.
+    # Each provider is independently optional; missing keys → 503 from that
+    # provider's endpoint, other providers still work.
+    payments_return_base_url: str = os.getenv("PAYMENTS_RETURN_BASE_URL", "http://localhost:5173")
+
+    stripe_secret_key: str = os.getenv("STRIPE_SECRET_KEY", "")
+    stripe_webhook_secret: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+
+    paypal_env: str = os.getenv("PAYPAL_ENV", "sandbox")
+    paypal_client_id: str = os.getenv("PAYPAL_CLIENT_ID", "")
+    paypal_client_secret: str = os.getenv("PAYPAL_CLIENT_SECRET", "")
+    paypal_webhook_id: str = os.getenv("PAYPAL_WEBHOOK_ID", "")
+
+    coingate_api_key: str = os.getenv("COINGATE_API_KEY", "")
+    coingate_api_base: str = os.getenv("COINGATE_API_BASE", "https://api-sandbox.coingate.com/v2")
+    coingate_webhook_secret: str = os.getenv("COINGATE_WEBHOOK_SECRET", "")
+
 
 @lru_cache
 def get_settings() -> Settings:
