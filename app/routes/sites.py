@@ -9,6 +9,7 @@ from app.auth import current_user_id
 from app.config import Settings, get_settings
 from app.db import admin_client
 from app.gateway import derive_subdomain
+from app.repo import RepoCloneError, clone_and_pack, validate_branch, validate_repo_url
 from app.storage import site_zip_path, slugify
 from app.worker import STATUS_UPLOADED, enqueue_provision, enqueue_teardown, inflight_count
 
@@ -60,6 +61,89 @@ async def upload_site(
             "user_id": user_id,
             "name": name,
             "original_filename": file.filename,
+            "size_bytes": written,
+            "status": STATUS_UPLOADED,
+        }
+    ).execute()
+
+    return {
+        "siteId": site_id,
+        "status": STATUS_UPLOADED,
+        "suggestedSubdomain": suggested_subdomain,
+    }
+
+
+@router.post("/upload-repo")
+async def upload_site_from_repo(
+    payload: dict = Body(...),
+    user_id: str = Depends(current_user_id),
+    settings: Settings = Depends(get_settings),
+):
+    """Mirror /upload but pull the site contents from a public GitHub URL.
+
+    Returns the same shape so the frontend can hand off to /provision the
+    same way it does for a zip upload.
+    """
+    repo_url = (payload.get("repoUrl") or payload.get("repo_url") or "").strip()
+    branch = (payload.get("branch") or "").strip() or None
+    if not repo_url:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "repoUrl is required")
+
+    site_id = str(uuid.uuid4())
+    # Resolve owner/repo up front so the on-disk filename matches what the
+    # /provision endpoint will reconstruct from `original_filename` later.
+    # `validate_repo_url` is cheap and raises the same RepoCloneError that
+    # clone_and_pack would, so error handling stays uniform.
+    try:
+        host, owner, repo = validate_repo_url(repo_url)
+        cleaned_branch = validate_branch(branch)
+    except RepoCloneError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+    slug = slugify(repo)
+    original_filename = f"{slug}.zip"
+    target = site_zip_path(settings.storage_root, user_id, site_id, display_name=slug)
+
+    try:
+        meta, written = clone_and_pack(
+            host=host,
+            owner=owner,
+            repo=repo,
+            branch=cleaned_branch,
+            target_zip=target,
+            timeout_seconds=settings.repo_clone_timeout_seconds,
+            max_files=settings.repo_clone_max_files,
+            max_bytes=settings.repo_clone_max_bytes,
+        )
+    except RepoCloneError as exc:
+        target.unlink(missing_ok=True)
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except Exception as exc:
+        log.exception("repo clone failed unexpectedly")
+        target.unlink(missing_ok=True)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Failed to import repository",
+        ) from exc
+
+    if written > settings.max_upload_bytes:
+        target.unlink(missing_ok=True)
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            "Packaged repo exceeds upload size limit",
+        )
+
+    name = f"{meta.owner}/{meta.repo}"
+    if meta.ref != "default":
+        name = f"{name}@{meta.ref}"
+    suggested_subdomain = derive_subdomain(meta.repo)
+
+    admin_client().table("sites").insert(
+        {
+            "id": site_id,
+            "user_id": user_id,
+            "name": name,
+            "original_filename": original_filename,
             "size_bytes": written,
             "status": STATUS_UPLOADED,
         }

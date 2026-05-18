@@ -25,6 +25,14 @@ class Settings:
     storage_root: str = os.getenv("STORAGE_ROOT", "/var/brieblast/clients")
     max_upload_bytes: int = int(os.getenv("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
 
+    # Public-repo upload (git clone). Limits mirror the zip path so users can't
+    # smuggle a larger payload by going through git instead of a file upload.
+    repo_clone_timeout_seconds: int = int(os.getenv("REPO_CLONE_TIMEOUT_SECONDS", "60") or 60)
+    repo_clone_max_bytes: int = int(
+        os.getenv("REPO_CLONE_MAX_BYTES", str(100 * 1024 * 1024))
+    )
+    repo_clone_max_files: int = int(os.getenv("REPO_CLONE_MAX_FILES", "5000") or 5000)
+
     # Provisioning backend
     provisioner_backend: str = os.getenv("PROVISIONER_BACKEND", "ansible")
     ansible_playbook_path: str = os.getenv(
