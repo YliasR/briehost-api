@@ -9,6 +9,12 @@ from app.auth import current_user_id
 from app.config import Settings, get_settings
 from app.db import admin_client
 from app.gateway import derive_subdomain
+from app.limits import (
+    assert_can_create_site,
+    assert_within_site_count,
+    assert_within_storage,
+    get_user_plan_limits,
+)
 from app.repo import RepoCloneError, clone_and_pack, validate_branch, validate_repo_url
 from app.storage import site_zip_path, slugify
 from app.worker import STATUS_QUEUED, STATUS_UPLOADED, enqueue_provision, enqueue_teardown, queue_depth
@@ -26,6 +32,12 @@ async def upload_site(
 ):
     if not file.filename or not file.filename.lower().endswith(".zip"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "File must be a .zip")
+
+    # Cheap upfront site-count check — bail out before streaming a multi-MB
+    # body if the user is already at their plan's site cap. Storage check
+    # happens below, after we know the actual upload size.
+    plan_limits = get_user_plan_limits(user_id)
+    assert_within_site_count(user_id, plan_limits)
 
     site_id = str(uuid.uuid4())
     name = Path(file.filename).stem or "site"
@@ -49,6 +61,15 @@ async def upload_site(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             "Failed to store uploaded file",
         ) from exc
+
+    # Storage check now that we know the real size. If it fails, drop the
+    # file we just wrote — no DB row was created yet so cleanup is just the
+    # filesystem.
+    try:
+        assert_within_storage(user_id, plan_limits, written)
+    except HTTPException:
+        target.unlink(missing_ok=True)
+        raise
 
     # Suggest a default subdomain from the filename so the UI can prefill it,
     # but don't claim it yet — that happens at /provision time after the user
@@ -88,6 +109,12 @@ async def upload_site_from_repo(
     branch = (payload.get("branch") or "").strip() or None
     if not repo_url:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "repoUrl is required")
+
+    # Upfront count check before we do anything expensive (git clone, zip).
+    # Storage check has to happen after clone_and_pack since we can't know
+    # the packed size in advance.
+    plan_limits = get_user_plan_limits(user_id)
+    assert_within_site_count(user_id, plan_limits)
 
     site_id = str(uuid.uuid4())
     # Resolve owner/repo up front so the on-disk filename matches what the
@@ -132,6 +159,14 @@ async def upload_site_from_repo(
             status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             "Packaged repo exceeds upload size limit",
         )
+
+    # Storage check — same pattern as /upload. Clean up the packed zip if
+    # we're over the plan cap.
+    try:
+        assert_within_storage(user_id, plan_limits, written)
+    except HTTPException:
+        target.unlink(missing_ok=True)
+        raise
 
     name = f"{meta.owner}/{meta.repo}"
     if meta.ref != "default":

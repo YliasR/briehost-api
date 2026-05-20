@@ -22,27 +22,14 @@ ProviderName = Literal["stripe", "paypal", "coingate", "skip"]
 PaymentStatus = Literal["pending", "succeeded", "failed", "cancelled"]
 
 
-# Server-side source of truth for plan prices (cents). Keep in sync with
-# brieblast-landing/src/lib/plans.ts. Never trust client-sent amounts —
-# always look up the price from the planId.
-PLAN_PRICES_CENTS: dict[str, int] = {
-    "smol_brie": 420,    # €4.20
-    "thicc_brie": 1337,  # €13.37
-    "mega_brie": 4269,   # €42.69
-}
-
-PLAN_DISPLAY_NAMES: dict[str, str] = {
-    "smol_brie": "Smol Brie",
-    "thicc_brie": "Thicc Brie",
-    "mega_brie": "Mega Brie",
-}
-
-
-def get_plan_price(plan_id: str) -> int:
-    """Returns price in cents. Raises ValueError for unknown plans."""
-    if plan_id not in PLAN_PRICES_CENTS:
-        raise ValueError(f"unknown plan: {plan_id!r}")
-    return PLAN_PRICES_CENTS[plan_id]
+# Plan catalogue (prices, display names, limits) lives in app/plans.py so
+# the payments module isn't the single owner of plan data. Re-exported here
+# for backward compatibility with provider modules that import from here.
+from app.plans import (  # noqa: E402, F401
+    PLAN_DISPLAY_NAMES,
+    PLAN_PRICES_CENTS,
+    get_plan_price,
+)
 
 
 @dataclass(frozen=True)
