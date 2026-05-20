@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
+from app.routes import payments, sites
 from app.health import start_monitor, stop_monitor
 from app.routes import sites
 from app.sync_gateway import resync as resync_gateway
@@ -23,6 +24,7 @@ app.add_middleware(
 )
 
 app.include_router(sites.router)
+app.include_router(payments.router)
 
 
 @app.on_event("startup")
