@@ -41,18 +41,18 @@ from app.payments import (
 
 log = logging.getLogger("briehost.payments.stripe")
 
-# Phase 2: card + bancontact. Stripe Checkout shows both as radio options
-# on its hosted page; the user picks per-transaction. Both are single-use,
-# EUR-only (which we already are), so no extra branching needed in our code.
+# `payment_method_types` is intentionally NOT set on the Checkout Session
+# below. When omitted, Stripe falls back to the Payment Methods configuration
+# attached to the account in the dashboard
+# (https://dashboard.stripe.com/test/settings/payment_methods). That means:
+#   - Adding a method = toggle it on in the dashboard, redeploy nothing.
+#   - Removing a method = toggle it off, same.
+#   - Each method's currency/country compatibility is filtered automatically.
 #
-# Bancontact is async — the user authorizes in their bank app, control returns
-# to Stripe, and only then does the session flip to paid. For most successful
-# payments the `checkout.session.completed` webhook fires with
-# `payment_status='paid'` and we're done. If Stripe needs longer (rare), we
-# get `completed` with `payment_status='unpaid'` first, then either
-# `async_payment_succeeded` or `async_payment_failed` later. Both are handled
-# in handle_webhook().
-PAYMENT_METHOD_TYPES = ["card", "bancontact"]
+# Async methods (Bancontact, iDEAL, SEPA, etc.) all hit the same webhook
+# event path: `checkout.session.completed` may arrive with payment_status
+# 'unpaid' (still settling) followed later by `async_payment_succeeded`
+# or `async_payment_failed`. handle_webhook() handles all three.
 
 
 def _require_configured(settings) -> None:
@@ -75,9 +75,10 @@ def create_intent(settings, user_id: str, plan_id: str) -> CheckoutSession:
     return_base = settings.payments_return_base_url.rstrip("/")
 
     try:
+        # No payment_method_types passed → Stripe uses the dashboard's
+        # Payment Methods configuration (see module docstring above).
         session = stripe_sdk.checkout.Session.create(
             mode="payment",
-            payment_method_types=PAYMENT_METHOD_TYPES,
             line_items=[
                 {
                     "price_data": {
