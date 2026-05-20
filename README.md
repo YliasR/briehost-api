@@ -48,6 +48,27 @@ Response `200`:
 
 Provisioning continues asynchronously; the dashboard polls `sites.status` via Supabase.
 
+## Runtime health checks
+
+The API starts a background monitor on boot when `HEALTHCHECK_ENABLED=true`.
+Every `HEALTHCHECK_INTERVAL_SECONDS`, it reads live sites from Supabase, checks
+their public URL (`https://<subdomain>.<GATEWAY_DOMAIN>/`) or tenant IP fallback,
+and records the result with `public.record_site_health_check(...)`.
+
+The dashboard status page only counts a site as online when that latest check is
+`up` and recent. A stopped Proxmox container should therefore flip the public
+status page to degraded/outage after the next monitor pass.
+
+Relevant env:
+
+```dotenv
+HEALTHCHECK_ENABLED=true
+HEALTHCHECK_INTERVAL_SECONDS=60
+HEALTHCHECK_TIMEOUT_SECONDS=5
+HEALTHCHECK_MAX_CONCURRENCY=10
+HEALTHCHECK_PUBLIC_SCHEME=https
+```
+
 ## Security notes
 
 - Zips are extracted with absolute-path / `..` / symlink rejection (see `app/storage.py`).

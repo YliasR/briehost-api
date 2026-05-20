@@ -29,6 +29,7 @@ from typing import Literal
 from app.config import Settings
 from app.db import admin_client
 from app.gateway import register_route, unregister_route
+from app.health import record_health_check
 from app.scanner import MalwareDetected, ScanError, clamd_scan
 from app.storage import UnsafeZipError, validate_zip_policy
 
@@ -409,6 +410,11 @@ def _provision_site_sync(
                     admin_client().table("sites").update(extra).eq("id", site_id).execute()
                 except Exception:
                     log.exception("could not persist live extras for site_id=%s", site_id)
+
+            try:
+                record_health_check(site_id, "up", None, 200, None)
+            except Exception:
+                log.exception("could not persist initial health check for site_id=%s", site_id)
 
             # Gateway route push. The subdomain was already claimed at /provision
             # time, so we just need to point Caddy at the freshly-allocated IP.

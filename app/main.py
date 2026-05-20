@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
+from app.health import start_monitor, stop_monitor
 from app.routes import sites
 from app.sync_gateway import resync as resync_gateway
 from app.worker import start_consumer, stop_consumer
@@ -39,10 +40,12 @@ async def _start_provision_consumer() -> None:
     # Single FIFO consumer for provision + teardown jobs. Must be created
     # inside the event loop, so this is async and lives in startup.
     await start_consumer(settings)
+    await start_monitor(settings)
 
 
 @app.on_event("shutdown")
 async def _stop_provision_consumer() -> None:
+    await stop_monitor()
     await stop_consumer()
 
 

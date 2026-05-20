@@ -86,3 +86,7 @@
           - "{{ composer_version.stdout_lines | first }}"
           - "PHP modules present: {{ php_modules.stdout_lines | join(', ') }}"
           - "php-fpm sockets: {{ php_fpm_sock.stdout_lines | join(', ') }}"
+
+  roles:
+    - hardening_os
+    - hardening_php
