@@ -148,8 +148,18 @@ def handle_webhook(settings, headers: dict[str, str], raw_body: bytes) -> Webhoo
         # failure so the route returns 400 instead of 5xx.
         raise WebhookVerificationError(f"invalid payload: {exc}") from exc
 
-    event_type = event["type"]
-    data = event["data"]["object"]
+    # Convert the whole event from Stripe's `StripeObject` (which has custom
+    # __getattr__/__getitem__ that breaks normal dict idioms like .get()) into
+    # plain dicts. `to_dict_recursive()` is the supported API for this on v6+.
+    # Falls back to dict() for very old SDKs that don't have the method.
+    if hasattr(event, "to_dict_recursive"):
+        event_dict = event.to_dict_recursive()
+    else:
+        event_dict = dict(event)
+
+    event_type = event_dict["type"]
+    data = event_dict["data"]["object"]
+    metadata = data.get("metadata") or {}
 
     # We only care about checkout.session.* in Phase 1. Other event types are
     # acknowledged with status='pending' (no-op) so Stripe stops retrying.
@@ -158,7 +168,6 @@ def handle_webhook(settings, headers: dict[str, str], raw_body: bytes) -> Webhoo
         # it can be 'unpaid' here and only flip after a separate event.
         # Phase 1 is card-only, so 'paid' is the expected path.
         if data.get("payment_status") == "paid":
-            metadata = data.get("metadata") or {}
             return WebhookResult(
                 intent_id=metadata.get("intent_id", ""),
                 provider="stripe",
@@ -169,7 +178,7 @@ def handle_webhook(settings, headers: dict[str, str], raw_body: bytes) -> Webhoo
         # payment_status='unpaid' on a completed session = async pending
         # (Phase 2 territory). Pending row stays pending until a follow-up event.
         return WebhookResult(
-            intent_id=(data.get("metadata") or {}).get("intent_id", ""),
+            intent_id=metadata.get("intent_id", ""),
             provider="stripe",
             provider_ref=data["id"],
             status="pending",
@@ -177,7 +186,6 @@ def handle_webhook(settings, headers: dict[str, str], raw_body: bytes) -> Webhoo
         )
 
     if event_type in ("checkout.session.expired", "checkout.session.async_payment_failed"):
-        metadata = data.get("metadata") or {}
         status = "cancelled" if event_type == "checkout.session.expired" else "failed"
         return WebhookResult(
             intent_id=metadata.get("intent_id", ""),
@@ -190,7 +198,7 @@ def handle_webhook(settings, headers: dict[str, str], raw_body: bytes) -> Webhoo
     # Unknown event — return a no-op pending so the route ACKs with 200.
     # Stripe will stop retrying. Logged so we notice if we're missing an
     # event type we should be handling.
-    log.info("ignoring Stripe event type=%s id=%s", event_type, event.get("id"))
+    log.info("ignoring Stripe event type=%s id=%s", event_type, event_dict.get("id"))
     return WebhookResult(
         intent_id="",
         provider="stripe",
