@@ -25,6 +25,7 @@ from urllib.parse import parse_qs
 
 import httpx
 
+from app.db import admin_client
 from app.payments import (
     CheckoutSession,
     PLAN_DISPLAY_NAMES,
@@ -38,7 +39,7 @@ from app.payments import (
 log = logging.getLogger("briehost.payments.coingate")
 
 # CoinGate order status → our PaymentStatus
-# Reference: https://developer.coingate.com/docs/order-statuses
+# Reference: https://developer.coingate.com/reference/order-statuses
 _STATUS_MAP = {
     "new": "pending",
     "pending": "pending",
@@ -47,13 +48,37 @@ _STATUS_MAP = {
     "invalid": "failed",
     "expired": "cancelled",
     "canceled": "cancelled",
-    "refunded": "failed",  # refunds are rare in our one-shot flow; treat as fail
+    # Refunds reverse a previously-paid order. In a real system we'd
+    # downgrade the user's plan; for the school demo we just mark the
+    # intent failed and leave the manual cleanup to ops.
+    "refunded": "failed",
+    "partially_refunded": "failed",
 }
 
 
 def _require_configured(settings) -> None:
     if not settings.coingate_api_key:
         raise ProviderNotConfiguredError("CoinGate is not configured (COINGATE_API_KEY missing)")
+
+
+def _lookup_intent_amount(intent_id: str) -> tuple[int | None, str | None]:
+    """Returns `(amount_cents, currency)` for the payment_intents row with
+    this id, or `(None, None)` if it doesn't exist. Used as a sanity check
+    on inbound webhook amounts so we don't flip a plan based on a forged
+    smaller-amount callback."""
+    rows = (
+        admin_client()
+        .table("payment_intents")
+        .select("amount_cents, currency")
+        .eq("id", intent_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if not rows:
+        return None, None
+    return rows[0].get("amount_cents"), rows[0].get("currency")
 
 
 def _verification_token(intent_id: str, webhook_secret: str) -> str:
@@ -96,7 +121,9 @@ def create_intent(settings, user_id: str, plan_id: str) -> CheckoutSession:
         "success_url": f"{return_base}/payment-return/{intent_id}?status=success",
         "cancel_url": f"{return_base}/payment-return/{intent_id}?status=cancel",
         "token": token,
-        "purchaser_email": "",  # CoinGate will ask on their page
+        # `customer_email` (not `purchaser_email`) is the canonical field per
+        # CoinGate's reference. We leave it unset — CoinGate prompts the
+        # shopper on their page if they haven't provided one.
     }
 
     headers = {
@@ -161,15 +188,51 @@ def handle_webhook(settings, headers: dict[str, str], raw_body: bytes) -> Webhoo
     order_id = fields.get("order_id", "")  # this is our intent_id
     status = fields.get("status", "")
     received_token = fields.get("token", "")
+    callback_price_amount = fields.get("price_amount", "")
+    callback_price_currency = fields.get("price_currency", "")
 
-    if not order_id or not received_token:
-        raise WebhookVerificationError("missing order_id or token in callback body")
+    if not order_id or not received_token or not coingate_id:
+        raise WebhookVerificationError(
+            "missing required fields (order_id / token / id) in callback body"
+        )
 
     expected_token = _verification_token(order_id, settings.coingate_webhook_secret)
     if not hmac.compare_digest(received_token, expected_token):
         raise WebhookVerificationError("token does not match expected HMAC")
 
     mapped_status = _STATUS_MAP.get(status, "pending")
+
+    # Belt-and-braces amount check on the success path, per CoinGate's own
+    # callback handling examples. If the callback claims `paid` but the
+    # amount/currency doesn't match what we created the order with, treat
+    # it as a hard failure rather than flipping the plan. The route layer
+    # looks up plan_id from the row, which gives us the expected amount.
+    if mapped_status == "succeeded":
+        try:
+            row_amount, row_currency = _lookup_intent_amount(order_id)
+        except Exception:
+            log.exception("could not look up intent amount for sanity check (intent=%s)", order_id)
+            row_amount, row_currency = None, None
+
+        if row_amount is not None:
+            try:
+                callback_cents = round(float(callback_price_amount) * 100)
+            except (TypeError, ValueError):
+                callback_cents = -1
+            if (
+                callback_cents != row_amount
+                or callback_price_currency.upper() != (row_currency or "").upper()
+            ):
+                log.error(
+                    "CoinGate amount/currency mismatch for intent=%s: "
+                    "callback=%s %s vs row=%s %s",
+                    order_id,
+                    callback_price_amount,
+                    callback_price_currency,
+                    row_amount,
+                    row_currency,
+                )
+                mapped_status = "failed"
     # We don't know the plan_id from CoinGate's payload (they don't echo our
     # metadata). The route layer looks up the existing payment_intents row by
     # (provider, provider_ref) and that row already has plan_id from create.
