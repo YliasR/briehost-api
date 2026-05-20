@@ -148,15 +148,11 @@ def handle_webhook(settings, headers: dict[str, str], raw_body: bytes) -> Webhoo
         # failure so the route returns 400 instead of 5xx.
         raise WebhookVerificationError(f"invalid payload: {exc}") from exc
 
-    # Convert the whole event from Stripe's `StripeObject` (which has custom
-    # __getattr__/__getitem__ that breaks normal dict idioms like .get()) into
-    # plain dicts. `to_dict_recursive()` is the supported API for this on v6+.
-    # Falls back to dict() for very old SDKs that don't have the method.
-    if hasattr(event, "to_dict_recursive"):
-        event_dict = event.to_dict_recursive()
-    else:
-        event_dict = dict(event)
-
+    # Stripe SDK v15+ removed StripeObject's dict inheritance AND
+    # to_dict_recursive(). The supported way to get a plain nested dict is
+    # `.to_dict()` (which now recurses automatically). See:
+    # https://github.com/stripe/stripe-python/wiki/Migration-guide-for-v15
+    event_dict = event.to_dict()
     event_type = event_dict["type"]
     data = event_dict["data"]["object"]
     metadata = data.get("metadata") or {}
