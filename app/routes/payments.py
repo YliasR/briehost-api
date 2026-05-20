@@ -66,10 +66,17 @@ def _flip_plan(user_id: str, plan_id: str) -> None:
     admin_client().table("profiles").update({"plan": plan_id}).eq("id", user_id).execute()
 
 
-def _update_intent_status(provider_ref: str, provider: str, status_value: str) -> str | None:
+def _update_intent_status(
+    provider_ref: str, provider: str, status_value: str
+) -> tuple[str | None, str | None]:
     """Mark an intent succeeded/failed/cancelled by provider+ref. Returns
-    the intent's `user_id` so the caller can flip the plan; None if no row
-    matched (out-of-band webhook, replay, etc.)."""
+    `(user_id, plan_id)` from the matched row so the caller can flip the
+    plan; `(None, None)` if no row matched (out-of-band webhook, replay).
+
+    `plan_id` is returned as a fallback for providers like CoinGate that
+    don't echo our metadata back through the webhook. Stripe does echo it,
+    but using the row as the canonical source avoids drift either way.
+    """
     res = (
         admin_client()
         .table("payment_intents")
@@ -80,8 +87,9 @@ def _update_intent_status(provider_ref: str, provider: str, status_value: str) -
     )
     rows = res.data or []
     if not rows:
-        return None
-    return rows[0].get("user_id")
+        return None, None
+    row = rows[0]
+    return row.get("user_id"), row.get("plan_id")
 
 
 # --- create intent --------------------------------------------------------
@@ -227,9 +235,15 @@ async def _handle_webhook(request: Request, provider_name: str, settings: Settin
         )
 
     try:
-        user_id = _update_intent_status(result.provider_ref, provider_name, result.status)
-        if result.status == "succeeded" and user_id and result.paid_plan_id:
-            _flip_plan(user_id, result.paid_plan_id)
+        user_id, row_plan_id = _update_intent_status(
+            result.provider_ref, provider_name, result.status
+        )
+        # Fall back to the row's plan_id if the provider didn't echo it back
+        # (CoinGate doesn't echo metadata; Stripe does — both end up flipping
+        # the right plan because the row is the source of truth).
+        plan_to_flip = result.paid_plan_id or row_plan_id
+        if result.status == "succeeded" and user_id and plan_to_flip:
+            _flip_plan(user_id, plan_to_flip)
     except Exception:
         log.exception(
             "%s webhook DB write failed for provider_ref=%s status=%s",
@@ -237,7 +251,7 @@ async def _handle_webhook(request: Request, provider_name: str, settings: Settin
             result.provider_ref,
             result.status,
         )
-        # Return 500 so Stripe retries — better than ACKing with 200 and
+        # Return 500 so the provider retries — better than ACKing 200 and
         # losing the event if the DB blip clears.
         raise HTTPException(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -249,7 +263,7 @@ async def _handle_webhook(request: Request, provider_name: str, settings: Settin
         provider_name,
         result.provider_ref,
         result.status,
-        result.paid_plan_id,
+        plan_to_flip,
         user_id if result.status == "succeeded" else None,
     )
     return {"ok": True}
