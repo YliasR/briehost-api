@@ -90,6 +90,10 @@ class Settings:
     # Each provider is independently optional; missing keys → 503 from that
     # provider's endpoint, other providers still work.
     payments_return_base_url: str = os.getenv("PAYMENTS_RETURN_BASE_URL", "http://localhost:5173")
+    # Public-internet URL where CoinGate (and any future async webhook source)
+    # POSTs callbacks. Must be reachable from outside — i.e. https://api.briehosting.be
+    # in prod, or a tunnel URL (ngrok / cloudflared) in dev.
+    payments_api_base_url: str = os.getenv("PAYMENTS_API_BASE_URL", "http://localhost:8000")
 
     stripe_secret_key: str = os.getenv("STRIPE_SECRET_KEY", "")
     stripe_webhook_secret: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
