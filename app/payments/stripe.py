@@ -16,11 +16,18 @@ means duplicate webhooks (Stripe retries on any 5xx or timeout) are safe.
 """
 from __future__ import annotations
 
-import json
 import logging
 import uuid
 
 import stripe as stripe_sdk
+
+# Stripe SDK v10+ moved error classes to the top level. Old `stripe.error.*`
+# paths still work as a back-compat shim in v10/11 but were removed in v12+.
+# Import the two we use directly so we don't care which version is installed.
+try:
+    from stripe import SignatureVerificationError, StripeError  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover — very old SDK
+    from stripe.error import SignatureVerificationError, StripeError  # type: ignore[no-redef]
 
 from app.payments import (
     CheckoutSession,
@@ -99,9 +106,10 @@ def create_intent(settings, user_id: str, plan_id: str) -> CheckoutSession:
                 },
             },
         )
-    except stripe_sdk.error.StripeError as exc:
+    except StripeError as exc:
         log.exception("Stripe Checkout Session create failed for user=%s plan=%s", user_id, plan_id)
-        raise RuntimeError(f"Stripe rejected the request: {exc.user_message or exc}") from exc
+        user_msg = getattr(exc, "user_message", None) or str(exc)
+        raise RuntimeError(f"Stripe rejected the request: {user_msg}") from exc
 
     return CheckoutSession(
         intent_id=intent_id,
@@ -133,7 +141,7 @@ def handle_webhook(settings, headers: dict[str, str], raw_body: bytes) -> Webhoo
             sig_header=sig_header,
             secret=settings.stripe_webhook_secret,
         )
-    except stripe_sdk.error.SignatureVerificationError as exc:
+    except SignatureVerificationError as exc:
         raise WebhookVerificationError(str(exc)) from exc
     except ValueError as exc:
         # Malformed payload (not valid JSON, etc.). Treat as a verification

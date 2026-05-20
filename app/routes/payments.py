@@ -212,14 +212,46 @@ async def _handle_webhook(request: Request, provider_name: str, settings: Settin
         log.warning("%s webhook signature verification failed: %s", provider_name, exc)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid signature") from exc
     except ProviderNotConfiguredError as exc:
+        log.error("%s webhook called but provider not configured: %s", provider_name, exc)
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     except NotImplementedError as exc:
         raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, str(exc)) from exc
+    except Exception:
+        # Last-resort guard: anything we don't recognize is logged with full
+        # traceback so we can debug from `journalctl` instead of staring at a
+        # generic 500 in Stripe's delivery log.
+        log.exception("%s webhook handler crashed", provider_name)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "webhook handler crashed; see API logs",
+        )
 
-    user_id = _update_intent_status(result.provider_ref, provider_name, result.status)
-    if result.status == "succeeded" and user_id and result.paid_plan_id:
-        _flip_plan(user_id, result.paid_plan_id)
+    try:
+        user_id = _update_intent_status(result.provider_ref, provider_name, result.status)
+        if result.status == "succeeded" and user_id and result.paid_plan_id:
+            _flip_plan(user_id, result.paid_plan_id)
+    except Exception:
+        log.exception(
+            "%s webhook DB write failed for provider_ref=%s status=%s",
+            provider_name,
+            result.provider_ref,
+            result.status,
+        )
+        # Return 500 so Stripe retries — better than ACKing with 200 and
+        # losing the event if the DB blip clears.
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "webhook DB write failed; will retry",
+        )
 
+    log.info(
+        "%s webhook handled: provider_ref=%s status=%s plan=%s user=%s",
+        provider_name,
+        result.provider_ref,
+        result.status,
+        result.paid_plan_id,
+        user_id if result.status == "succeeded" else None,
+    )
     return {"ok": True}
 
 
