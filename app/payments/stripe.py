@@ -41,8 +41,18 @@ from app.payments import (
 
 log = logging.getLogger("briehost.payments.stripe")
 
-# Phase 1: card only. Phase 2 adds 'bancontact'.
-PAYMENT_METHOD_TYPES = ["card"]
+# Phase 2: card + bancontact. Stripe Checkout shows both as radio options
+# on its hosted page; the user picks per-transaction. Both are single-use,
+# EUR-only (which we already are), so no extra branching needed in our code.
+#
+# Bancontact is async — the user authorizes in their bank app, control returns
+# to Stripe, and only then does the session flip to paid. For most successful
+# payments the `checkout.session.completed` webhook fires with
+# `payment_status='paid'` and we're done. If Stripe needs longer (rare), we
+# get `completed` with `payment_status='unpaid'` first, then either
+# `async_payment_succeeded` or `async_payment_failed` later. Both are handled
+# in handle_webhook().
+PAYMENT_METHOD_TYPES = ["card", "bancontact"]
 
 
 def _require_configured(settings) -> None:
@@ -157,12 +167,14 @@ def handle_webhook(settings, headers: dict[str, str], raw_body: bytes) -> Webhoo
     data = event_dict["data"]["object"]
     metadata = data.get("metadata") or {}
 
-    # We only care about checkout.session.* in Phase 1. Other event types are
-    # acknowledged with status='pending' (no-op) so Stripe stops retrying.
+    # Event matrix:
+    #   completed + paid          → succeeded (cards, instant Bancontact)
+    #   completed + unpaid        → still pending (async Bancontact, wait for next event)
+    #   async_payment_succeeded   → succeeded (late-arriving Bancontact settlement)
+    #   async_payment_failed      → failed
+    #   expired                   → cancelled
+    #   anything else             → ack as pending, log
     if event_type == "checkout.session.completed":
-        # payment_status is 'paid' for cards; for async methods (Bancontact)
-        # it can be 'unpaid' here and only flip after a separate event.
-        # Phase 1 is card-only, so 'paid' is the expected path.
         if data.get("payment_status") == "paid":
             return WebhookResult(
                 intent_id=metadata.get("intent_id", ""),
@@ -171,14 +183,25 @@ def handle_webhook(settings, headers: dict[str, str], raw_body: bytes) -> Webhoo
                 status="succeeded",
                 paid_plan_id=metadata.get("plan_id"),
             )
-        # payment_status='unpaid' on a completed session = async pending
-        # (Phase 2 territory). Pending row stays pending until a follow-up event.
+        # Async-payment-pending. Row stays 'pending' until async_payment_*
+        # event lands. Don't touch the plan yet.
         return WebhookResult(
             intent_id=metadata.get("intent_id", ""),
             provider="stripe",
             provider_ref=data["id"],
             status="pending",
             paid_plan_id=None,
+        )
+
+    if event_type == "checkout.session.async_payment_succeeded":
+        # Late settlement of an async method (typically Bancontact). The
+        # plan flip happens here, NOT on the earlier `completed` event.
+        return WebhookResult(
+            intent_id=metadata.get("intent_id", ""),
+            provider="stripe",
+            provider_ref=data["id"],
+            status="succeeded",
+            paid_plan_id=metadata.get("plan_id"),
         )
 
     if event_type in ("checkout.session.expired", "checkout.session.async_payment_failed"):
