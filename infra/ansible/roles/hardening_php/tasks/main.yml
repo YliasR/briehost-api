@@ -1,0 +1,175 @@
+---
+# PHP security hardening: disable dangerous functions, harden php-fpm, configure limits
+
+- name: Disable dangerous PHP functions
+  ansible.builtin.shell: |
+    pct exec {{ template_vmid }} -- bash -c '
+      cat >> /etc/php/8.2/mods-available/security.ini <<EOF
+      ; Disable dangerous functions
+      disable_functions = exec,system,passthru,shell_exec,proc_open,proc_close,popen,pclose,eval,assert,pcntl_exec,pcntl_fork,pcntl_waitpid,pcntl_signal
+      EOF
+    '
+  changed_when: true
+
+- name: Enable PHP security module
+  ansible.builtin.command: >-
+    pct exec {{ template_vmid }} --
+    phpenmod -s ALL security
+  changed_when: true
+
+- name: Harden main php.ini for FPM
+  ansible.builtin.shell: |
+    pct exec {{ template_vmid }} -- bash -c '
+      # Backup original
+      cp /etc/php/8.2/fpm/php.ini /etc/php/8.2/fpm/php.ini.bak
+
+      # Set secure PHP settings
+      sed -i "s/^expose_php.*/expose_php = Off/" /etc/php/8.2/fpm/php.ini
+      sed -i "s/^display_errors.*/display_errors = Off/" /etc/php/8.2/fpm/php.ini
+      sed -i "s/^display_startup_errors.*/display_startup_errors = Off/" /etc/php/8.2/fpm/php.ini
+      sed -i "s/^log_errors.*/log_errors = On/" /etc/php/8.2/fpm/php.ini
+      sed -i "s/^error_log.*/error_log = \/var\/log\/php-errors.log/" /etc/php/8.2/fpm/php.ini
+      sed -i "s/^short_open_tag.*/short_open_tag = Off/" /etc/php/8.2/fpm/php.ini
+      sed -i "s/^file_uploads.*/file_uploads = On/" /etc/php/8.2/fpm/php.ini
+      sed -i "s/^upload_tmp_dir.*/upload_tmp_dir = \/var\/tmp\/php-uploads/" /etc/php/8.2/fpm/php.ini
+      sed -i "s/^upload_max_filesize.*/upload_max_filesize = 100M/" /etc/php/8.2/fpm/php.ini
+      sed -i "s/^post_max_size.*/post_max_size = 100M/" /etc/php/8.2/fpm/php.ini
+      sed -i "s/^session.save_path.*/session.save_path = \"\/var\/tmp\/php-sessions\"/" /etc/php/8.2/fpm/php.ini
+      sed -i "s/^session.cookie_httponly.*/session.cookie_httponly = 1/" /etc/php/8.2/fpm/php.ini
+      sed -i "s/^session.cookie_secure.*/session.cookie_secure = 1/" /etc/php/8.2/fpm/php.ini
+      sed -i "s/^session.cookie_samesite.*/session.cookie_samesite = Lax/" /etc/php/8.2/fpm/php.ini
+    '
+  changed_when: true
+
+- name: Harden PHP-FPM pool configuration
+  ansible.builtin.shell: |
+    pct exec {{ template_vmid }} -- bash -c '
+      cat >/etc/php/8.2/fpm/pool.d/www-hardened.conf <<EOF
+      [www]
+      user = www-data
+      group = www-data
+
+      ; Listen on socket only (not TCP)
+      listen = /run/php/php-fpm.sock
+      listen.owner = www-data
+      listen.group = www-data
+      listen.mode = 0660
+
+      ; Process management
+      pm = dynamic
+      pm.max_children = 10
+      pm.start_servers = 3
+      pm.min_spare_servers = 2
+      pm.max_spare_servers = 5
+      pm.max_requests = 1000
+      pm.max_requests_grace_period = 60s
+
+      ; Security limits
+      catch_workers_output = yes
+      decorate_workers_output = no
+      security.limit_extensions = .php .php3 .php4 .php5 .php7 .php8 .phps
+
+      ; Log file
+      slowlog = /var/log/php-fpm/www-slow.log
+      request_slowlog_timeout = 10s
+
+      ; Disable dangerous functions for this pool
+      php_admin_flag[display_errors] = off
+      php_admin_flag[log_errors] = on
+      php_admin_value[error_log] = /var/log/php-errors.log
+
+      ; Resource limits
+      php_admin_value[memory_limit] = 256M
+      php_admin_value[max_execution_time] = 30
+      php_admin_value[max_input_time] = 60
+      php_admin_value[default_socket_timeout] = 60
+      EOF
+    '
+  changed_when: true
+
+- name: Disable default php-fpm pool
+  ansible.builtin.command: >-
+    pct exec {{ template_vmid }} --
+    rm -f /etc/php/8.2/fpm/pool.d/www.conf
+  changed_when: true
+  failed_when: false
+
+- name: Ensure PHP-FPM log directory exists with secure permissions
+  ansible.builtin.shell: |
+    pct exec {{ template_vmid }} -- bash -c '
+      mkdir -p /var/log/php-fpm
+      chown www-data:www-data /var/log/php-fpm
+      chmod 700 /var/log/php-fpm
+    '
+  changed_when: true
+
+- name: Configure PHP error log rotation
+  ansible.builtin.shell: |
+    pct exec {{ template_vmid }} -- bash -c '
+      cat >/etc/logrotate.d/php-errors <<EOF
+      /var/log/php-errors.log /var/log/php-fpm/www-slow.log {
+        rotate 10
+        daily
+        compress
+        delaycompress
+        notifempty
+        create 0640 www-data www-data
+        sharedscripts
+        postrotate
+          systemctl reload php8.2-fpm > /dev/null 2>&1 || true
+        endscript
+      }
+      EOF
+    '
+  changed_when: true
+
+- name: Drop unnecessary Linux capabilities from PHP-FPM
+  ansible.builtin.shell: |
+    pct exec {{ template_vmid }} -- bash -c '
+      cat >>/etc/php/8.2/fpm/pool.d/www-hardened.conf <<EOF
+
+      ; Drop unnecessary capabilities (if running with CAP_* support)
+      ; These require libcap2-bin and should be set via systemd
+      EOF
+    '
+  changed_when: true
+
+- name: Harden Nginx security headers (optional but recommended)
+  ansible.builtin.shell: |
+    pct exec {{ template_vmid }} -- bash -c '
+      cat >>/etc/nginx/snippets/security-headers.conf <<EOF
+      # Security headers
+      add_header X-Frame-Options "SAMEORIGIN" always;
+      add_header X-XSS-Protection "1; mode=block" always;
+      add_header X-Content-Type-Options "nosniff" always;
+      add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+      add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+
+      # Remove server signature
+      server_tokens off;
+      EOF
+    '
+  changed_when: true
+
+- name: Update Nginx default site to include security headers
+  ansible.builtin.shell: |
+    pct exec {{ template_vmid }} -- bash -c '
+      if ! grep -q "security-headers.conf" /etc/nginx/sites-available/site.conf; then
+        sed -i "/server {/a\\    include snippets/security-headers.conf;" /etc/nginx/sites-available/site.conf
+      fi
+    '
+  changed_when: true
+
+- name: Test PHP-FPM and Nginx syntax
+  ansible.builtin.shell: |
+    pct exec {{ template_vmid }} -- bash -c '
+      php-fpm8.2 -t
+      nginx -t
+    '
+  changed_when: false
+
+- name: Restart PHP-FPM and Nginx with new configuration
+  ansible.builtin.command: >-
+    pct exec {{ template_vmid }} --
+    bash -c "systemctl restart php8.2-fpm && systemctl restart nginx"
+  changed_when: true

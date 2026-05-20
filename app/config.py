@@ -72,6 +72,14 @@ class Settings:
         os.getenv("GATEWAY_REQUEST_TIMEOUT_SECONDS", "5") or 5
     )
 
+    # Runtime health checks for live sites. The public /status page only counts
+    # sites with a recent passing check as online.
+    healthcheck_enabled: bool = _bool("HEALTHCHECK_ENABLED", "true")
+    healthcheck_interval_seconds: int = int(os.getenv("HEALTHCHECK_INTERVAL_SECONDS", "60") or 60)
+    healthcheck_timeout_seconds: float = float(os.getenv("HEALTHCHECK_TIMEOUT_SECONDS", "5") or 5)
+    healthcheck_max_concurrency: int = int(os.getenv("HEALTHCHECK_MAX_CONCURRENCY", "10") or 10)
+    healthcheck_public_scheme: str = os.getenv("HEALTHCHECK_PUBLIC_SCHEME", "https").strip() or "https"
+
     allowed_origins: list[str] = [
         o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",") if o.strip()
     ]
