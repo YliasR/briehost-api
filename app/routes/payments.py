@@ -139,6 +139,30 @@ async def create_intent(
     }
 
 
+@router.get("/intents")
+async def list_intents(
+    user_id: str = Depends(current_user_id),
+    limit: int = 50,
+):
+    """All payment_intents for the current user, newest first. Used by the
+    dashboard's billing section. Capped at `limit` (default 50) so a user
+    who somehow racks up thousands doesn't ship a huge response — pagination
+    can come later if anyone hits that wall."""
+    limit = max(1, min(limit, 200))  # clamp to a sane range
+    rows = (
+        admin_client()
+        .table("payment_intents")
+        .select("id, plan_id, provider, status, amount_cents, currency, created_at")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+    return {"intents": rows}
+
+
 @router.get("/intents/{intent_id}")
 async def get_intent(
     intent_id: str,
