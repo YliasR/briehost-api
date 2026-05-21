@@ -20,9 +20,17 @@ PlanId = str  # 'none' | 'smol_brie' | 'thicc_brie' | 'mega_brie' | 'admin'
 @dataclass(frozen=True)
 class PlanLimits:
     """A `None` value means "unlimited" — checked explicitly in app/limits.py
-    rather than a sentinel like math.inf so the intent is unmistakable."""
+    rather than a sentinel like math.inf so the intent is unmistakable.
+
+    `lxc_disk_gb` is the rootfs size the provisioner allocates to that tenant's
+    Proxmox container. Thin-provisioned, so it's a ceiling not a reservation;
+    sizing it to roughly match `max_storage_bytes` keeps the CT from running
+    out of disk before the API quota would block the next upload. Smol stays
+    at 8 GB because PHP + OS overhead won't comfortably fit in a 5 GB rootfs.
+    """
     max_sites: int | None
     max_storage_bytes: int | None
+    lxc_disk_gb: int
 
 
 _GB = 1024 * 1024 * 1024
@@ -31,11 +39,11 @@ _GB = 1024 * 1024 * 1024
 # (or use the skip flow if we ever build it). This is the gate that gives
 # the payment flow actual teeth.
 PLAN_LIMITS: dict[str, PlanLimits] = {
-    "none": PlanLimits(max_sites=0, max_storage_bytes=0),
-    "smol_brie": PlanLimits(max_sites=1, max_storage_bytes=5 * _GB),
-    "thicc_brie": PlanLimits(max_sites=None, max_storage_bytes=50 * _GB),
-    "mega_brie": PlanLimits(max_sites=None, max_storage_bytes=200 * _GB),
-    "admin": PlanLimits(max_sites=None, max_storage_bytes=None),
+    "none": PlanLimits(max_sites=0, max_storage_bytes=0, lxc_disk_gb=8),
+    "smol_brie": PlanLimits(max_sites=1, max_storage_bytes=5 * _GB, lxc_disk_gb=8),
+    "thicc_brie": PlanLimits(max_sites=None, max_storage_bytes=50 * _GB, lxc_disk_gb=50),
+    "mega_brie": PlanLimits(max_sites=None, max_storage_bytes=200 * _GB, lxc_disk_gb=200),
+    "admin": PlanLimits(max_sites=None, max_storage_bytes=None, lxc_disk_gb=200),
 }
 
 # Sensible fallback for any unknown / missing plan value (legacy rows,
