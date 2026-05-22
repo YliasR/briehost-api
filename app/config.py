@@ -41,6 +41,15 @@ class Settings:
     ansible_delete_playbook_path: str = os.getenv(
         "ANSIBLE_DELETE_PLAYBOOK_PATH", "infra/ansible/playbooks/delete_site.yml"
     )
+    ansible_redeploy_playbook_path: str = os.getenv(
+        "ANSIBLE_REDEPLOY_PLAYBOOK_PATH", "infra/ansible/playbooks/redeploy_site.yml"
+    )
+    # Cooldown between consecutive redeploys of the same site. Prevents a user
+    # spam-clicking "update" and stacking N identical jobs on the queue. Admin
+    # bypasses. 0 disables the check entirely.
+    redeploy_rate_limit_seconds: int = int(
+        os.getenv("REDEPLOY_RATE_LIMIT_SECONDS", "60") or 60
+    )
     ansible_inventory_path: str = os.getenv(
         "ANSIBLE_INVENTORY_PATH", "infra/ansible/inventory/production.ini"
     )

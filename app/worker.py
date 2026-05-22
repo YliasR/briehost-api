@@ -22,6 +22,7 @@ import subprocess
 import shutil
 import tempfile
 import zipfile
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -31,8 +32,9 @@ from app.db import admin_client
 from app.gateway import register_route, unregister_route
 from app.health import record_health_check
 from app.limits import get_user_plan_limits
+from app.repo import RepoCloneError, clone_and_pack, validate_branch, validate_repo_url
 from app.scanner import MalwareDetected, ScanError, clamd_scan
-from app.storage import UnsafeZipError, validate_zip_policy
+from app.storage import UnsafeZipError, site_zip_path, slugify, validate_zip_policy
 
 log = logging.getLogger("briehost.worker")
 
@@ -42,6 +44,7 @@ STATUS_QUEUED = "queued"
 STATUS_SCANNING = "scanning"
 STATUS_SCAN_FAILED = "scan_failed"
 STATUS_PROVISIONING = "provisioning"
+STATUS_UPDATING = "updating"
 STATUS_LIVE = "live"
 STATUS_FAILED = "failed"
 
@@ -52,7 +55,7 @@ _TRIM = 4000  # cap for stderr/stdout we persist
 
 # --- queue plumbing -------------------------------------------------------
 
-JobKind = Literal["provision", "teardown"]
+JobKind = Literal["provision", "teardown", "redeploy"]
 
 
 @dataclass(frozen=True)
@@ -72,7 +75,22 @@ class TeardownJob:
     zip_path: Path | None
 
 
-Job = ProvisionJob | TeardownJob
+@dataclass(frozen=True)
+class RedeployJob:
+    """Re-deploy a site to its existing CT from its stored repo URL/branch.
+
+    No new clone/provision — `_redeploy_site_sync` re-pulls the repo, re-scans,
+    then runs the redeploy ansible playbook against the site's existing vmid.
+    """
+    kind: Literal["redeploy"]
+    site_id: str
+    user_id: str
+    repo_host: str
+    repo_url: str
+    repo_branch: str | None
+
+
+Job = ProvisionJob | TeardownJob | RedeployJob
 
 # Initialized in start_consumer() (needs to bind to the running event loop).
 _queue: asyncio.Queue[Job | None] | None = None
@@ -147,6 +165,17 @@ async def _consumer_loop(settings: Settings) -> None:
                         job.user_id,
                         job.zip_path,
                         job.subdomain,
+                    )
+                elif isinstance(job, RedeployJob):
+                    await loop.run_in_executor(
+                        None,
+                        _redeploy_site_sync,
+                        settings,
+                        job.site_id,
+                        job.user_id,
+                        job.repo_host,
+                        job.repo_url,
+                        job.repo_branch,
                     )
                 else:
                     await loop.run_in_executor(
@@ -235,6 +264,44 @@ def _run_ansible(
         json.dumps(extra_vars),
     ]
     log.info("running: %s", " ".join(shlex.quote(c) for c in cmd))
+    proc = subprocess.run(
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=settings.ansible_timeout_seconds,
+    )
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def _run_redeploy_ansible(
+    settings: Settings, site_id: str, user_id: str, vmid: int, zip_path: Path
+) -> tuple[int, str, str]:
+    """Run the redeploy playbook against an *existing* CT. No clone, no IP
+    allocation — just push the new zip and run deploy-site.sh."""
+    site_slug = zip_path.stem.removesuffix(f"-{site_id}") or "site"
+    extra_vars: dict[str, object] = {
+        "site_id": site_id,
+        "user_id": user_id,
+        "site_slug": site_slug,
+        "zip_path": str(zip_path),
+        "new_vmid": vmid,
+        "target_node": settings.proxmox_node,
+    }
+    try:
+        extra_vars.update(json.loads(settings.ansible_extra_vars_json or "{}"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"ANSIBLE_EXTRA_VARS_JSON is not valid JSON: {exc}") from exc
+
+    cmd = [
+        "ansible-playbook",
+        settings.ansible_redeploy_playbook_path,
+        "-i",
+        settings.ansible_inventory_path,
+        "-e",
+        json.dumps(extra_vars),
+    ]
+    log.info("running redeploy: %s", " ".join(shlex.quote(c) for c in cmd))
     proc = subprocess.run(
         cmd,
         check=False,
@@ -511,6 +578,137 @@ def _teardown_site_sync(
         log.exception("delete playbook crashed for site_id=%s", site_id)
 
 
+def _redeploy_site_sync(
+    settings: Settings,
+    site_id: str,
+    user_id: str,
+    repo_host: str,
+    repo_url: str,
+    repo_branch: str | None,
+) -> None:
+    """Refresh a live site's contents from its stored repo. CT, subdomain, and
+    gateway route stay put — we just re-pull the repo, re-scan, and push the
+    new zip into the existing CT via deploy-site.sh.
+
+    On failure we mark the row 'failed' (with an error message). The CT keeps
+    serving whatever was there before; user can hit redeploy again after fixing
+    the upstream repo.
+    """
+    try:
+        # Look up the CT's vmid — we can't redeploy without it.
+        rows = (
+            admin_client()
+            .table("sites")
+            .select("vmid, original_filename, name")
+            .eq("id", site_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not rows:
+            log.error("redeploy: site %s vanished from DB before worker ran", site_id)
+            return
+        site = rows[0]
+        vmid = site.get("vmid")
+        if not vmid:
+            _set_status(site_id, STATUS_FAILED, "redeploy: site has no vmid (was it ever live?)")
+            return
+
+        _set_status(site_id, STATUS_UPDATING)
+
+        try:
+            host, owner, repo = validate_repo_url(repo_url)
+            cleaned_branch = validate_branch(repo_branch)
+        except RepoCloneError as exc:
+            _set_status(site_id, STATUS_FAILED, f"redeploy: bad repo url: {exc}")
+            return
+
+        slug = slugify(repo)
+        target = site_zip_path(settings.storage_root, user_id, site_id, display_name=slug)
+
+        try:
+            _meta, written = clone_and_pack(
+                host=host,
+                owner=owner,
+                repo=repo,
+                branch=cleaned_branch,
+                target_zip=target,
+                timeout_seconds=settings.repo_clone_timeout_seconds,
+                max_files=settings.repo_clone_max_files,
+                max_bytes=settings.repo_clone_max_bytes,
+            )
+        except RepoCloneError as exc:
+            _set_status(site_id, STATUS_FAILED, f"redeploy clone failed: {exc}")
+            return
+
+        if written > settings.max_upload_bytes:
+            target.unlink(missing_ok=True)
+            _set_status(site_id, STATUS_FAILED, "redeploy: packaged repo exceeds upload size limit")
+            return
+
+        # Same zip + malware pipeline as a fresh provision — same security
+        # posture for fresh uploads and updates.
+        try:
+            validate_zip_policy(
+                target,
+                max_files=settings.max_zip_files,
+                max_uncompressed_bytes=settings.max_zip_uncompressed_bytes,
+                max_compression_ratio=settings.max_zip_compression_ratio,
+            )
+        except (UnsafeZipError, zipfile.BadZipFile, OSError) as exc:
+            _set_status(site_id, STATUS_FAILED, f"redeploy zip policy: {exc}")
+            return
+
+        if settings.enable_malware_scan:
+            try:
+                _scan_with_php_malware_finder(settings, target)
+            except MalwareDetected as exc:
+                _set_status(site_id, STATUS_FAILED, f"redeploy php malware: {exc}")
+                return
+            except ScanError as exc:
+                _set_status(site_id, STATUS_FAILED, f"redeploy php scanner unavailable: {exc}")
+                return
+
+            try:
+                clamd_scan(
+                    target,
+                    settings.clamd_host,
+                    settings.clamd_port,
+                    settings.clamd_socket,
+                )
+            except MalwareDetected as exc:
+                _set_status(site_id, STATUS_FAILED, f"redeploy malware: {exc}")
+                return
+            except ScanError as exc:
+                _set_status(site_id, STATUS_FAILED, f"redeploy scanner unavailable: {exc}")
+                return
+
+        try:
+            rc, stdout, stderr = _run_redeploy_ansible(settings, site_id, user_id, int(vmid), target)
+        except subprocess.TimeoutExpired as exc:
+            _set_status(
+                site_id,
+                STATUS_FAILED,
+                f"redeploy ansible timed out after {settings.ansible_timeout_seconds}s: {exc}",
+            )
+            return
+
+        if rc == 0:
+            # Stay 'live' — site never changed identity, just got fresher bits.
+            _set_status(
+                site_id,
+                STATUS_LIVE,
+                extra={"last_deploy_at": datetime.now(timezone.utc).isoformat()},
+            )
+        else:
+            tail = (stderr or stdout)[-_TRIM:]
+            _set_status(site_id, STATUS_FAILED, f"redeploy ansible rc={rc}: {tail}")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("redeploy crashed for site_id=%s", site_id)
+        _set_status_safe(site_id, STATUS_FAILED, f"redeploy worker crash: {exc}")
+
+
 # --- public enqueue API (called from routes) ------------------------------
 
 
@@ -537,6 +735,35 @@ def enqueue_provision(
             user_id=user_id,
             zip_path=zip_path,
             subdomain=subdomain,
+        )
+    )
+
+
+def enqueue_redeploy(
+    settings: Settings,
+    site_id: str,
+    user_id: str,
+    repo_host: str,
+    repo_url: str,
+    repo_branch: str | None,
+) -> None:
+    """Add a redeploy job to the FIFO queue.
+
+    Shares the queue with provision/teardown so `pct exec` calls into the
+    tenant CT stay serialized and can't race a concurrent provision finishing
+    on the same Proxmox host.
+    """
+    if _queue is None:
+        raise RuntimeError("provision consumer is not running; enqueue called before startup")
+    _set_status_safe(site_id, STATUS_QUEUED)
+    _queue.put_nowait(
+        RedeployJob(
+            kind="redeploy",
+            site_id=site_id,
+            user_id=user_id,
+            repo_host=repo_host,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
         )
     )
 

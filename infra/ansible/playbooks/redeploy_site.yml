@@ -1,0 +1,51 @@
+---
+# Redeploy a site into its existing tenant CT. No clone, no IP allocation,
+# no gateway changes — just push the new zip and re-run deploy-site.sh.
+#
+# Required extra vars (passed by app/worker.py):
+#   site_id      UUID of the site row in Supabase
+#   site_slug    Human-readable slug used when staging the zip
+#   zip_path     Absolute path on the API host to the validated zip
+#   new_vmid     VMID of the existing tenant CT to push into
+#   target_node  Proxmox node name (e.g. "pve")
+
+- name: Redeploy site into existing CT
+  hosts: proxmox
+  gather_facts: false
+
+  pre_tasks:
+    - name: Validate required extra-vars
+      ansible.builtin.assert:
+        that:
+          - site_id is defined and site_id | length > 0
+          - zip_path is defined and zip_path | length > 0
+          - new_vmid is defined and (new_vmid | int) > 0
+          - target_node is defined and target_node | length > 0
+        fail_msg: "Missing or invalid redeploy inputs"
+
+    - name: Verify zip exists on the controller
+      ansible.builtin.stat:
+        path: "{{ zip_path }}"
+      delegate_to: localhost
+      become: false
+      register: zip_path_stat
+
+    - name: Reject missing/non-regular zip paths
+      ansible.builtin.assert:
+        that:
+          - zip_path_stat.stat.exists
+          - zip_path_stat.stat.isreg
+        fail_msg: "zip_path missing or not a regular file on the controller: {{ zip_path }}"
+
+    - name: Confirm the target CT exists on this node
+      ansible.builtin.command: pct status {{ new_vmid }}
+      register: pct_status
+      changed_when: false
+      failed_when: pct_status.rc != 0
+
+  roles:
+    # start_container is idempotent — if the CT was already running it's a no-op.
+    # Necessary in case the user stopped it manually between deploys.
+    - start_container
+    - deploy_site_zip
+    - healthcheck

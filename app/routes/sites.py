@@ -1,6 +1,7 @@
 """Site upload + teardown endpoints."""
 import logging
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status
@@ -18,7 +19,15 @@ from app.limits import (
 )
 from app.repo import RepoCloneError, clone_and_pack, validate_branch, validate_repo_url
 from app.storage import site_zip_path, slugify
-from app.worker import STATUS_QUEUED, STATUS_UPLOADED, enqueue_provision, enqueue_teardown, queue_depth
+from app.worker import (
+    STATUS_LIVE,
+    STATUS_QUEUED,
+    STATUS_UPLOADED,
+    enqueue_provision,
+    enqueue_redeploy,
+    enqueue_teardown,
+    queue_depth,
+)
 
 log = logging.getLogger("briehost.routes.sites")
 
@@ -182,6 +191,11 @@ async def upload_site_from_repo(
             "original_filename": original_filename,
             "size_bytes": written,
             "status": STATUS_UPLOADED,
+            # Persist the source so a later one-click redeploy can re-pull
+            # without making the user re-enter the URL + branch.
+            "repo_host": host,
+            "repo_url": repo_url,
+            "repo_branch": cleaned_branch,
         }
     ).execute()
 
@@ -272,6 +286,94 @@ async def provision_uploaded_site(
     enqueue_provision(settings, site_id, user_id, zip_path, subdomain)
 
     return {"siteId": site_id, "status": STATUS_QUEUED, "subdomain": subdomain}
+
+
+@router.post("/{site_id}/redeploy", status_code=status.HTTP_202_ACCEPTED)
+async def redeploy_site(
+    site_id: str,
+    user_id: str = Depends(current_user_id),
+    settings: Settings = Depends(get_settings),
+):
+    """One-click update: re-pull the site's stored repo and push the new
+    contents into the existing CT. No new provisioning, no new subdomain.
+
+    Requires the site to have been uploaded via /upload-repo (so we have a
+    repo_url on the row). Zip-uploaded sites have nothing to pull from —
+    those users still need to re-upload.
+
+    Rate-limited per site to stop rapid re-clicks from stacking the queue.
+    Admin bypasses both the ownership check and the rate limit.
+    """
+    is_admin = get_user_plan(user_id) == "admin"
+    lookup = (
+        admin_client()
+        .table("sites")
+        .select("id, user_id, status, vmid, repo_host, repo_url, repo_branch, last_deploy_at")
+        .eq("id", site_id)
+    )
+    if not is_admin:
+        lookup = lookup.eq("user_id", user_id)
+    rows = lookup.limit(1).execute().data or []
+    if not rows:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "site not found")
+    site = rows[0]
+    owner_id = site.get("user_id") or user_id
+
+    if not site.get("repo_url"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "site was not uploaded from a git repo — re-upload to update",
+        )
+    if not site.get("vmid"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "site has no CT yet (never went live) — provision it first",
+        )
+    # Only allow redeploys from terminal states. 'queued'/'updating'/
+    # 'provisioning'/'scanning' all mean a worker is already touching the
+    # row; stacking a second job risks racing the first.
+    if site.get("status") not in (STATUS_LIVE, "failed"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"site cannot be redeployed in status={site.get('status')}",
+        )
+
+    # Per-site rate limit. Admins bypass — they need to be able to push hot
+    # fixes during demos. 0 in settings disables for everyone.
+    if not is_admin and settings.redeploy_rate_limit_seconds > 0:
+        last = site.get("last_deploy_at")
+        if last:
+            try:
+                last_dt = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+                age = (datetime.now(timezone.utc) - last_dt).total_seconds()
+                if age < settings.redeploy_rate_limit_seconds:
+                    raise HTTPException(
+                        status.HTTP_429_TOO_MANY_REQUESTS,
+                        f"Last redeploy was {int(age)}s ago; wait "
+                        f"{int(settings.redeploy_rate_limit_seconds - age)}s.",
+                    )
+            except ValueError:
+                # Unparseable timestamp — let it through rather than block on
+                # a corrupt row.
+                pass
+
+    # Queue backpressure — same rule as /provision, admins bypass.
+    if not is_admin and queue_depth() >= settings.max_concurrent_provisions:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Provisioning queue is full, retry shortly",
+        )
+
+    enqueue_redeploy(
+        settings,
+        site_id,
+        owner_id,
+        site["repo_host"],
+        site["repo_url"],
+        site.get("repo_branch"),
+    )
+
+    return {"siteId": site_id, "status": STATUS_QUEUED}
 
 
 @router.delete("/{site_id}", status_code=status.HTTP_200_OK)
