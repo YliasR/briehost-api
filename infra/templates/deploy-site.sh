@@ -201,6 +201,13 @@ ENV
        && ls "$WEB_ROOT"/vite.config.* >/dev/null 2>&1 \
        && [[ ! -f "$WEB_ROOT/public/build/manifest.json" ]]; then
         echo "Vite project detected — building frontend assets."
+        # npm caches under $HOME/.npm (i.e. /var/www/.npm for www-data). If
+        # anything ever ran `npm` as root in this CT — including a template
+        # provisioning step — that dir gets created root-owned and every
+        # subsequent www-data run fails with EACCES. Force ownership before
+        # touching npm.
+        mkdir -p /var/www/.npm
+        chown -R "$WEB_USER:$WEB_USER" /var/www/.npm
         # npm ci is reproducible (uses package-lock.json) but only works when
         # the lockfile is present; fall back to install otherwise. Both as
         # www-data so any cached artifacts in node_modules land with the
