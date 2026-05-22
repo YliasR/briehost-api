@@ -235,8 +235,9 @@ async def provision_uploaded_site(
     # Backpressure: queue depth includes the currently-running job + everything
     # waiting. Reject when the queue is full so users get a 503 instead of
     # piling up an unbounded backlog. The setting name is legacy ("concurrent")
-    # but its meaning is now "max queue depth".
-    if queue_depth() >= settings.max_concurrent_provisions:
+    # but its meaning is now "max queue depth". Admins bypass — they need to
+    # be able to provision regardless of how clogged the queue is.
+    if get_user_plan(user_id) != "admin" and queue_depth() >= settings.max_concurrent_provisions:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "Provisioning queue is full, retry shortly",
