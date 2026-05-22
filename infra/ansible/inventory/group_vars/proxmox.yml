@@ -12,6 +12,10 @@ proxmox_api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
 tenant_pool: briehost
 tenant_bridge: vmbr1            # bridge that sits behind the OPNsense LAN
 tenant_disk_storage: local-lvm  # thin-provisioned by default on local-lvm
+# Fallback rootfs size. The API worker overrides this per-tenant via extra-vars
+# (`tenant_disk_gb` from app.plans.PLAN_LIMITS) so each plan tier gets a CT
+# sized to roughly match its storage quota. This 8 GB value only takes effect
+# for manual `ansible-playbook` invocations without `-e tenant_disk_gb=...`.
 tenant_disk_gb: 8
 tenant_cores: 1
 tenant_memory_mb: 512

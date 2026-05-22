@@ -207,16 +207,13 @@ ENV
         # right owner.
         if [[ -f "$WEB_ROOT/package-lock.json" ]]; then
             runuser -u "$WEB_USER" -- \
-                npm --prefix "$WEB_ROOT" ci --no-audit --no-fund --loglevel=error \
-                || echo "WARNING: npm ci failed; frontend assets may be missing." >&2
+                npm --prefix "$WEB_ROOT" ci --no-audit --no-fund --loglevel=error
         else
             runuser -u "$WEB_USER" -- \
-                npm --prefix "$WEB_ROOT" install --no-audit --no-fund --loglevel=error \
-                || echo "WARNING: npm install failed; frontend assets may be missing." >&2
+                npm --prefix "$WEB_ROOT" install --no-audit --no-fund --loglevel=error
         fi
         runuser -u "$WEB_USER" -- \
-            npm --prefix "$WEB_ROOT" run build --silent \
-            || echo "WARNING: npm run build failed; @vite() will throw at runtime." >&2
+            npm --prefix "$WEB_ROOT" run build --silent
 
         # node_modules is huge and pointless at runtime — drop it after build.
         rm -rf "$WEB_ROOT/node_modules"

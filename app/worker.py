@@ -30,6 +30,7 @@ from app.config import Settings
 from app.db import admin_client
 from app.gateway import register_route, unregister_route
 from app.health import record_health_check
+from app.limits import get_user_plan_limits
 from app.scanner import MalwareDetected, ScanError, clamd_scan
 from app.storage import UnsafeZipError, validate_zip_policy
 
@@ -206,6 +207,11 @@ def _run_ansible(
 ) -> tuple[int, str, str]:
     # Filename is `<slug>-<site_id>.zip`; recover the slug for human-readable hostnames.
     site_slug = zip_path.stem.removesuffix(f"-{site_id}") or "site"
+    # Per-plan rootfs sizing. Read the user's plan and pick the matching
+    # ceiling; `get_user_plan_limits` falls back to the most-restrictive tier
+    # for unknown / NULL plan values, so a bad row defaults to the 8 GB
+    # minimum rather than silently provisioning a huge disk.
+    plan_limits = get_user_plan_limits(user_id)
     extra_vars: dict[str, object] = {
         "site_id": site_id,
         "user_id": user_id,
@@ -213,6 +219,7 @@ def _run_ansible(
         "zip_path": str(zip_path),
         "target_node": settings.proxmox_node,
         "template_vmid": settings.php_template_vmid,
+        "tenant_disk_gb": plan_limits.lxc_disk_gb,
     }
     try:
         extra_vars.update(json.loads(settings.ansible_extra_vars_json or "{}"))

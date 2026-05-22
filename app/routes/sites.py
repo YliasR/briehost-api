@@ -13,6 +13,7 @@ from app.limits import (
     assert_can_create_site,
     assert_within_site_count,
     assert_within_storage,
+    get_user_plan,
     get_user_plan_limits,
 )
 from app.repo import RepoCloneError, clone_and_pack, validate_branch, validate_repo_url
@@ -284,27 +285,30 @@ async def delete_site(
     """
     # Look up before delete so we can pass subdomain/zip path to the teardown.
     # `.eq("user_id", user_id)` enforces ownership at the API layer in addition
-    # to whatever RLS does in Postgres — defense in depth.
-    rows = (
+    # to whatever RLS does in Postgres — defense in depth. Admins bypass the
+    # ownership filter so they can clean up other users' sites from the dash.
+    is_admin = get_user_plan(user_id) == "admin"
+    lookup = (
         admin_client()
         .table("sites")
         .select("id, user_id, subdomain, original_filename, name")
         .eq("id", site_id)
-        .eq("user_id", user_id)
-        .limit(1)
-        .execute()
-        .data
-        or []
     )
+    if not is_admin:
+        lookup = lookup.eq("user_id", user_id)
+    rows = lookup.limit(1).execute().data or []
     if not rows:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "site not found")
     site = rows[0]
+    owner_id = site.get("user_id") or user_id
 
     # Reconstruct the zip path the upload endpoint wrote to. We don't store
-    # the absolute path in the DB, but the layout is deterministic.
+    # the absolute path in the DB, but the layout is deterministic. Use the
+    # site's actual owner — for an admin deleting someone else's site, the
+    # zip lives under that user's storage tree, not the admin's.
     slug = slugify(Path(site.get("original_filename") or site.get("name") or "site").stem)
     try:
-        zip_path = site_zip_path(settings.storage_root, user_id, site_id, display_name=slug)
+        zip_path = site_zip_path(settings.storage_root, owner_id, site_id, display_name=slug)
     except Exception:
         log.exception("could not derive zip path for site_id=%s; teardown will skip the file", site_id)
         zip_path = None
@@ -312,7 +316,10 @@ async def delete_site(
     # Delete the row first so the dashboard reflects the action immediately.
     # If teardown later fails, we'll have an orphan CT — preferable to leaving
     # the row in a "deleting" limbo when the user clicked a destructive button.
-    admin_client().table("sites").delete().eq("id", site_id).eq("user_id", user_id).execute()
+    delete_q = admin_client().table("sites").delete().eq("id", site_id)
+    if not is_admin:
+        delete_q = delete_q.eq("user_id", user_id)
+    delete_q.execute()
 
     enqueue_teardown(
         settings,
