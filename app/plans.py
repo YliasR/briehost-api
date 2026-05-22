@@ -41,8 +41,8 @@ _GB = 1024 * 1024 * 1024
 PLAN_LIMITS: dict[str, PlanLimits] = {
     "none": PlanLimits(max_sites=0, max_storage_bytes=0, lxc_disk_gb=8),
     "smol_brie": PlanLimits(max_sites=1, max_storage_bytes=5 * _GB, lxc_disk_gb=8),
-    "thicc_brie": PlanLimits(max_sites=None, max_storage_bytes=50 * _GB, lxc_disk_gb=50),
-    "mega_brie": PlanLimits(max_sites=None, max_storage_bytes=200 * _GB, lxc_disk_gb=200),
+    "thicc_brie": PlanLimits(max_sites=3, max_storage_bytes=50 * _GB, lxc_disk_gb=50),
+    "mega_brie": PlanLimits(max_sites=5, max_storage_bytes=200 * _GB, lxc_disk_gb=200),
     "admin": PlanLimits(max_sites=None, max_storage_bytes=None, lxc_disk_gb=200),
 }
 
