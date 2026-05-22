@@ -44,7 +44,10 @@ rule NonPrintableChars
     so we have to use atoms (https://gist.github.com/Neo23x0/e3d4e316d7441d9143c7)
     to get an acceptable speed.
     */
-    $non_printables = /(function|return|base64_decode).{,256}[^\x09-\x0d\x20-\x7E]{3}/
+    // Tuned: dropped `function`/`return` (in every PHP file — any UTF-8 char
+    // like é/€/BOM fired the rule) and bumped the run from 3 to 8 bytes.
+    // A UTF-8 codepoint is 2-3 bytes; obfuscated payloads have hundreds.
+    $non_printables = /(eval|base64_decode|gzinflate|gzuncompress|str_rot13|assert)\s*\(.{,128}[^\x09-\x0d\x20-\x7E]{8,}/
 
   condition:
         (any of them) and not IsWhitelisted
