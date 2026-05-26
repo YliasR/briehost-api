@@ -26,6 +26,7 @@ from app.worker import (
     enqueue_provision,
     enqueue_redeploy,
     enqueue_teardown,
+    enqueue_zip_redeploy,
     queue_depth,
 )
 
@@ -288,27 +289,20 @@ async def provision_uploaded_site(
     return {"siteId": site_id, "status": STATUS_QUEUED, "subdomain": subdomain}
 
 
-@router.post("/{site_id}/redeploy", status_code=status.HTTP_202_ACCEPTED)
-async def redeploy_site(
-    site_id: str,
-    user_id: str = Depends(current_user_id),
-    settings: Settings = Depends(get_settings),
-):
-    """One-click update: re-pull the site's stored repo and push the new
-    contents into the existing CT. No new provisioning, no new subdomain.
+def _load_site_for_redeploy(site_id: str, user_id: str) -> tuple[dict, bool]:
+    """Look up the site and assert the caller may redeploy it.
 
-    Requires the site to have been uploaded via /upload-repo (so we have a
-    repo_url on the row). Zip-uploaded sites have nothing to pull from —
-    those users still need to re-upload.
-
-    Rate-limited per site to stop rapid re-clicks from stacking the queue.
-    Admin bypasses both the ownership check and the rate limit.
+    Shared by /redeploy, /redeploy-zip, /redeploy-from-repo. Returns the row
+    plus an `is_admin` flag so callers can apply the same rate-limit bypass.
     """
     is_admin = get_user_plan(user_id) == "admin"
     lookup = (
         admin_client()
         .table("sites")
-        .select("id, user_id, status, vmid, repo_host, repo_url, repo_branch, last_deploy_at")
+        .select(
+            "id, user_id, status, vmid, repo_host, repo_url, repo_branch, "
+            "last_deploy_at, original_filename, name"
+        )
         .eq("id", site_id)
     )
     if not is_admin:
@@ -317,13 +311,7 @@ async def redeploy_site(
     if not rows:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "site not found")
     site = rows[0]
-    owner_id = site.get("user_id") or user_id
 
-    if not site.get("repo_url"):
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            "site was not uploaded from a git repo — re-upload to update",
-        )
     if not site.get("vmid"):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -337,9 +325,11 @@ async def redeploy_site(
             status.HTTP_409_CONFLICT,
             f"site cannot be redeployed in status={site.get('status')}",
         )
+    return site, is_admin
 
-    # Per-site rate limit. Admins bypass — they need to be able to push hot
-    # fixes during demos. 0 in settings disables for everyone.
+
+def _enforce_redeploy_limits(site: dict, settings: Settings, is_admin: bool) -> None:
+    """Per-site rate limit + global queue backpressure. Admins bypass both."""
     if not is_admin and settings.redeploy_rate_limit_seconds > 0:
         last = site.get("last_deploy_at")
         if last:
@@ -357,12 +347,39 @@ async def redeploy_site(
                 # a corrupt row.
                 pass
 
-    # Queue backpressure — same rule as /provision, admins bypass.
     if not is_admin and queue_depth() >= settings.max_concurrent_provisions:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "Provisioning queue is full, retry shortly",
         )
+
+
+@router.post("/{site_id}/redeploy", status_code=status.HTTP_202_ACCEPTED)
+async def redeploy_site(
+    site_id: str,
+    user_id: str = Depends(current_user_id),
+    settings: Settings = Depends(get_settings),
+):
+    """One-click update: re-pull the site's stored repo and push the new
+    contents into the existing CT. No new provisioning, no new subdomain.
+
+    Requires the site to have a stored repo_url. Zip-uploaded sites must use
+    /redeploy-zip or /redeploy-from-repo to update.
+
+    Rate-limited per site to stop rapid re-clicks from stacking the queue.
+    Admin bypasses both the ownership check and the rate limit.
+    """
+    site, is_admin = _load_site_for_redeploy(site_id, user_id)
+    owner_id = site.get("user_id") or user_id
+
+    if not site.get("repo_url"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "site was not uploaded from a git repo — upload a new zip or "
+            "switch this site to a repo source instead",
+        )
+
+    _enforce_redeploy_limits(site, settings, is_admin)
 
     enqueue_redeploy(
         settings,
@@ -372,6 +389,134 @@ async def redeploy_site(
         site["repo_url"],
         site.get("repo_branch"),
     )
+
+    return {"siteId": site_id, "status": STATUS_QUEUED}
+
+
+@router.post("/{site_id}/redeploy-zip", status_code=status.HTTP_202_ACCEPTED)
+async def redeploy_site_from_zip(
+    site_id: str,
+    file: UploadFile = File(...),
+    user_id: str = Depends(current_user_id),
+    settings: Settings = Depends(get_settings),
+):
+    """Update a live site by uploading a fresh zip. CT, subdomain, and gateway
+    route stay put — we just re-scan the new bundle and push it into the
+    existing vmid.
+
+    Works for both zip-uploaded and repo-uploaded sites. Same security pipeline
+    as /upload + /provision: zip policy → php-malware-finder → clamav, then
+    redeploy ansible against the existing CT.
+    """
+    if not file.filename or not file.filename.lower().endswith(".zip"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "File must be a .zip")
+
+    site, is_admin = _load_site_for_redeploy(site_id, user_id)
+    owner_id = site.get("user_id") or user_id
+
+    _enforce_redeploy_limits(site, settings, is_admin)
+
+    # Per-plan storage cap still applies — a redeploy can grow the site.
+    plan_limits = get_user_plan_limits(owner_id)
+
+    # Overwrite the existing zip in place (same slug + site_id). Worker will
+    # pick up whatever bytes are on disk under that path.
+    slug = slugify(Path(site.get("original_filename") or site.get("name") or "site").stem)
+    target = site_zip_path(settings.storage_root, owner_id, site_id, display_name=slug)
+
+    # Write to a sibling temp file first so a partial/oversized upload doesn't
+    # clobber the working zip the site was last deployed from. Swap on success.
+    tmp_target = target.with_suffix(".zip.partial")
+    written = 0
+    try:
+        with tmp_target.open("wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                written += len(chunk)
+                if written > settings.max_upload_bytes:
+                    raise HTTPException(
+                        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        "File exceeds 100 MB",
+                    )
+                out.write(chunk)
+    except HTTPException:
+        tmp_target.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        tmp_target.unlink(missing_ok=True)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Failed to store uploaded file",
+        ) from exc
+
+    try:
+        assert_within_storage(owner_id, plan_limits, written)
+    except HTTPException:
+        tmp_target.unlink(missing_ok=True)
+        raise
+
+    tmp_target.replace(target)
+
+    # Update size_bytes so the dashboard storage bar reflects the new bundle.
+    try:
+        admin_client().table("sites").update(
+            {"size_bytes": written, "original_filename": file.filename}
+        ).eq("id", site_id).execute()
+    except Exception:
+        log.exception("could not persist new size for site_id=%s", site_id)
+
+    enqueue_zip_redeploy(settings, site_id, owner_id, target)
+
+    return {"siteId": site_id, "status": STATUS_QUEUED}
+
+
+@router.post("/{site_id}/redeploy-from-repo", status_code=status.HTTP_202_ACCEPTED)
+async def redeploy_site_from_repo(
+    site_id: str,
+    payload: dict = Body(...),
+    user_id: str = Depends(current_user_id),
+    settings: Settings = Depends(get_settings),
+):
+    """Update a live site from a (possibly new) git repo URL. Persists the
+    repo_url/branch onto the row so future one-click /redeploy calls work
+    without re-supplying it, then enqueues the standard repo redeploy flow.
+
+    This is how a zip-uploaded site "switches" to a git source, or how a
+    repo-uploaded site swaps to a different repo.
+    """
+    repo_url = (payload.get("repoUrl") or payload.get("repo_url") or "").strip()
+    branch = (payload.get("branch") or "").strip() or None
+    if not repo_url:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "repoUrl is required")
+
+    site, is_admin = _load_site_for_redeploy(site_id, user_id)
+    owner_id = site.get("user_id") or user_id
+
+    try:
+        host, _owner, _repo = validate_repo_url(repo_url)
+        cleaned_branch = validate_branch(branch)
+    except RepoCloneError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+    _enforce_redeploy_limits(site, settings, is_admin)
+
+    # Persist the new source on the row so subsequent one-click redeploys
+    # don't need the payload again.
+    try:
+        admin_client().table("sites").update(
+            {
+                "repo_host": host,
+                "repo_url": repo_url,
+                "repo_branch": cleaned_branch,
+            }
+        ).eq("id", site_id).execute()
+    except Exception as exc:
+        log.exception("could not persist repo source for site_id=%s", site_id)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Failed to update site source",
+        ) from exc
+
+    enqueue_redeploy(settings, site_id, owner_id, host, repo_url, cleaned_branch)
 
     return {"siteId": site_id, "status": STATUS_QUEUED}
 
