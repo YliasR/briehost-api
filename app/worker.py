@@ -55,7 +55,7 @@ _TRIM = 4000  # cap for stderr/stdout we persist
 
 # --- queue plumbing -------------------------------------------------------
 
-JobKind = Literal["provision", "teardown", "redeploy"]
+JobKind = Literal["provision", "teardown", "redeploy", "zip_redeploy"]
 
 
 @dataclass(frozen=True)
@@ -90,7 +90,19 @@ class RedeployJob:
     repo_branch: str | None
 
 
-Job = ProvisionJob | TeardownJob | RedeployJob
+@dataclass(frozen=True)
+class ZipRedeployJob:
+    """Re-deploy a site using a freshly-uploaded zip. CT stays put — we just
+    re-scan the new zip and push it into the existing vmid via the redeploy
+    ansible playbook. Mirrors RedeployJob but skips the clone step.
+    """
+    kind: Literal["zip_redeploy"]
+    site_id: str
+    user_id: str
+    zip_path: Path
+
+
+Job = ProvisionJob | TeardownJob | RedeployJob | ZipRedeployJob
 
 # Initialized in start_consumer() (needs to bind to the running event loop).
 _queue: asyncio.Queue[Job | None] | None = None
@@ -176,6 +188,15 @@ async def _consumer_loop(settings: Settings) -> None:
                         job.repo_host,
                         job.repo_url,
                         job.repo_branch,
+                    )
+                elif isinstance(job, ZipRedeployJob):
+                    await loop.run_in_executor(
+                        None,
+                        _zip_redeploy_site_sync,
+                        settings,
+                        job.site_id,
+                        job.user_id,
+                        job.zip_path,
                     )
                 else:
                     await loop.run_in_executor(
@@ -709,6 +730,99 @@ def _redeploy_site_sync(
         _set_status_safe(site_id, STATUS_FAILED, f"redeploy worker crash: {exc}")
 
 
+def _zip_redeploy_site_sync(
+    settings: Settings,
+    site_id: str,
+    user_id: str,
+    zip_path: Path,
+) -> None:
+    """Refresh a live site's contents from a freshly-uploaded zip. Same
+    security pipeline as a fresh provision (zip policy + php-malware-finder +
+    clamav), then push into the existing CT via the redeploy ansible playbook.
+
+    On failure the CT keeps serving the previous bits; row goes to 'failed'
+    with an error message the dashboard surfaces.
+    """
+    try:
+        rows = (
+            admin_client()
+            .table("sites")
+            .select("vmid")
+            .eq("id", site_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not rows:
+            log.error("zip redeploy: site %s vanished from DB before worker ran", site_id)
+            return
+        vmid = rows[0].get("vmid")
+        if not vmid:
+            _set_status(site_id, STATUS_FAILED, "zip redeploy: site has no vmid (was it ever live?)")
+            return
+
+        _set_status(site_id, STATUS_UPDATING)
+
+        try:
+            validate_zip_policy(
+                zip_path,
+                max_files=settings.max_zip_files,
+                max_uncompressed_bytes=settings.max_zip_uncompressed_bytes,
+                max_compression_ratio=settings.max_zip_compression_ratio,
+            )
+        except (UnsafeZipError, zipfile.BadZipFile, OSError) as exc:
+            _set_status(site_id, STATUS_FAILED, f"zip redeploy zip policy: {exc}")
+            return
+
+        if settings.enable_malware_scan:
+            try:
+                _scan_with_php_malware_finder(settings, zip_path)
+            except MalwareDetected as exc:
+                _set_status(site_id, STATUS_FAILED, f"zip redeploy php malware: {exc}")
+                return
+            except ScanError as exc:
+                _set_status(site_id, STATUS_FAILED, f"zip redeploy php scanner unavailable: {exc}")
+                return
+
+            try:
+                clamd_scan(
+                    zip_path,
+                    settings.clamd_host,
+                    settings.clamd_port,
+                    settings.clamd_socket,
+                )
+            except MalwareDetected as exc:
+                _set_status(site_id, STATUS_FAILED, f"zip redeploy malware: {exc}")
+                return
+            except ScanError as exc:
+                _set_status(site_id, STATUS_FAILED, f"zip redeploy scanner unavailable: {exc}")
+                return
+
+        try:
+            rc, stdout, stderr = _run_redeploy_ansible(settings, site_id, user_id, int(vmid), zip_path)
+        except subprocess.TimeoutExpired as exc:
+            _set_status(
+                site_id,
+                STATUS_FAILED,
+                f"zip redeploy ansible timed out after {settings.ansible_timeout_seconds}s: {exc}",
+            )
+            return
+
+        if rc == 0:
+            _set_status(
+                site_id,
+                STATUS_LIVE,
+                extra={"last_deploy_at": datetime.now(timezone.utc).isoformat()},
+            )
+        else:
+            tail = (stderr or stdout)[-_TRIM:]
+            _set_status(site_id, STATUS_FAILED, f"zip redeploy ansible rc={rc}: {tail}")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("zip redeploy crashed for site_id=%s", site_id)
+        _set_status_safe(site_id, STATUS_FAILED, f"zip redeploy worker crash: {exc}")
+
+
 # --- public enqueue API (called from routes) ------------------------------
 
 
@@ -764,6 +878,29 @@ def enqueue_redeploy(
             repo_host=repo_host,
             repo_url=repo_url,
             repo_branch=repo_branch,
+        )
+    )
+
+
+def enqueue_zip_redeploy(
+    settings: Settings,
+    site_id: str,
+    user_id: str,
+    zip_path: Path,
+) -> None:
+    """Add a zip-based redeploy job to the FIFO queue.
+
+    Same queue as everything else so Proxmox-side operations stay serialized.
+    """
+    if _queue is None:
+        raise RuntimeError("provision consumer is not running; enqueue called before startup")
+    _set_status_safe(site_id, STATUS_QUEUED)
+    _queue.put_nowait(
+        ZipRedeployJob(
+            kind="zip_redeploy",
+            site_id=site_id,
+            user_id=user_id,
+            zip_path=zip_path,
         )
     )
 
