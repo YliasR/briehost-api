@@ -244,7 +244,7 @@ tail -f /var/log/php-fpm/www-slow.log
 ✗ SQL injection (developer responsibility)
 ✗ XSS in application code (developer responsibility)
 ✗ Tenant-to-tenant network attacks (handled by OPNsense firewall)
-✗ Malware in uploaded zips (handled by ClamAV scanning)
+✗ Malware in uploaded zips (mitigated by ClamAV + YARA signatures, but not a full sandbox/detonation pipeline)
 
 ### Multi-Tenant Isolation
 - Network isolation via OPNsense (different bridge)

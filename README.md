@@ -72,5 +72,6 @@ HEALTHCHECK_PUBLIC_SCHEME=https
 ## Security notes
 
 - Zips are extracted with absolute-path / `..` / symlink rejection (see `app/storage.py`).
+- Uploads are scanned by ClamAV (`clamd`) and YARA PHP/webshell signatures before provisioning.
 - JWT verification uses Supabase JWKS (cached); no shared secret in the repo.
 - Service-role key must never leave the server.
