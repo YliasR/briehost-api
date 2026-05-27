@@ -20,7 +20,21 @@ class Settings:
     proxmox_token_id: str = os.getenv("PROXMOX_TOKEN_ID", "")
     proxmox_token_secret: str = os.getenv("PROXMOX_TOKEN_SECRET", "")
     proxmox_node: str = os.getenv("PROXMOX_NODE", "pve")
+    # Legacy single-template setting. Prefer PHP_TEMPLATE_VMIDS (list) — this is
+    # kept for back-compat and as the fallback when the list var is unset.
     php_template_vmid: int = int(os.getenv("PHP_TEMPLATE_VMID", "0") or 0)
+    # Pool of equivalent PHP LXC templates. Each entry is a separate template
+    # VMID; the worker spawns one consumer per template so N clones can run in
+    # parallel (Proxmox serializes full clones per source VMID, so multiple
+    # source VMIDs = real concurrency). Comma-separated, e.g. "9000,9001".
+    php_template_vmids: list[int] = [
+        int(v.strip())
+        for v in (
+            os.getenv("PHP_TEMPLATE_VMIDS")
+            or os.getenv("PHP_TEMPLATE_VMID", "0")
+        ).split(",")
+        if v.strip() and int(v.strip()) > 0
+    ]
 
     storage_root: str = os.getenv("STORAGE_ROOT", "/var/brieblast/clients")
     max_upload_bytes: int = int(os.getenv("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
