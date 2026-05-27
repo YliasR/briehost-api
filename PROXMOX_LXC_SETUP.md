@@ -189,12 +189,12 @@ Uploads land here as `<user_id>/<slug>-<site_id>.zip` — slug is derived from t
 ```bash
 apt update
 apt install -y python3 python3-venv python3-pip curl git \
-               clamav clamav-daemon
+               clamav clamav-daemon yara
 ```
 
 > **Don't `apt install ansible`** — Debian 12 ships ansible-core 2.14, which is too old for current `community.general` (needs ≥ 2.17). Install ansible into the venv in step 4 instead.
 
-`clamav-daemon` provides `clamd`, used by the upload scanner. Debian commonly starts it with a Unix socket at `/run/clamav/clamd.ctl`, which this app can use directly.
+`clamav-daemon` provides `clamd`, used by the upload scanner. `yara` powers the PHP/webshell signature pass (`app/php.yar`). Debian commonly starts `clamd` with a Unix socket at `/run/clamav/clamd.ctl`, which this app can use directly.
 
 Initial ClamAV setup:
 

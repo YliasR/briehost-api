@@ -379,3 +379,38 @@ rule Websites
     condition:
         (any of them) and not IsWhitelisted
 }
+
+rule PhpAutoPrependBackdoor
+{
+    strings:
+        $auto_prepend = /(auto_prepend_file|php_value\s+auto_prepend_file)\s+/ nocase
+        $php_input = /php:\/\/(input|filter)/ nocase
+        $data_wrapper = /data:\/\/text\/plain;base64,/ nocase
+        $remote_include = /(https?|ftp):\/\/[^"'\s]+/ nocase
+    condition:
+        $auto_prepend and 1 of ($php_input, $data_wrapper, $remote_include) and not IsWhitelisted
+}
+
+rule PhpRuntimeDropper
+{
+    strings:
+        $write = /file_put_contents\s*\(/ nocase
+        $decode = /(base64_decode|gzinflate|str_rot13)\s*\(/ nocase
+        $request = /\$_(GET|POST|REQUEST|COOKIE|SERVER)\s*\[/ nocase
+        $chmod = /chmod\s*\(\s*[^,]+,\s*0?7[0-7]{2}\s*\)/ nocase
+        $php_open = /<\?php/ nocase
+    condition:
+        $write and $decode and $request and 1 of ($chmod, $php_open) and not IsWhitelisted
+}
+
+rule PhpWebshellCommandFlow
+{
+    strings:
+        $input = /\$_(GET|POST|REQUEST|COOKIE|SERVER)\s*\[/ nocase
+        $cmd_exec = /\b(system|shell_exec|passthru|exec|popen|proc_open|assert)\s*\(/ nocase
+        $stream_open = /php:\/\/input/ nocase
+        $error_suppress = /@\s*(system|shell_exec|passthru|exec|assert)\s*\(/ nocase
+        $callback_exec = /call_user_func(_array)?\s*\(\s*\$_(GET|POST|REQUEST|COOKIE|SERVER)/ nocase
+    condition:
+        $input and 1 of ($cmd_exec, $stream_open, $error_suppress, $callback_exec) and not IsWhitelisted
+}
