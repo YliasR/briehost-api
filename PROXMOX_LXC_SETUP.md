@@ -114,6 +114,30 @@ The tenant CTs are full clones of this. Build it once, snapshot, convert to temp
 5. Stop the CT, then **right-click → Convert to template** (or `pct template <vmid>` from the host).
 6. Note the VMID. Put it in the API CT's `.env` as `PHP_TEMPLATE_VMID`.
 
+#### Optional: parallel provisioning (N templates)
+
+The worker spawns one provisioning consumer per template VMID listed in
+`PHP_TEMPLATE_VMIDS` (comma-separated). Proxmox holds a per-source lock during
+a full clone, so two clones from the same VMID serialize — but two clones from
+*different* VMIDs run in parallel. To enable 2-way parallelism:
+
+```bash
+# On the Proxmox host, clone the golden template into a sibling.
+# Pick any free VMID; 9001 is just a convention.
+pct clone 9000 9001 --full 1 --hostname php-template-2
+pct template 9001
+```
+
+Then in the API CT's `.env`:
+
+```
+PHP_TEMPLATE_VMIDS=9000,9001
+```
+
+When the golden template gets a security patch or PHP config change, repeat
+the clone (after deleting the old 9001) so the pool stays consistent. Or
+re-run `setup_php_template.yml` against each VMID in turn.
+
 ### F. Variables to set in `infra/ansible/inventory/group_vars/proxmox.yml`
 
 Most defaults work; the ones you'll likely change:

@@ -1,15 +1,18 @@
 """Background provisioning worker.
 
-Single-consumer asyncio queue. Provision and teardown jobs are FIFO-serialized
-through one consumer so concurrent uploads can't race Proxmox (`pvesh get
-/cluster/nextid` is informational and the LVM-thin template lock serializes
-storage-side anyway). The consumer runs the sync pipeline in a thread executor
-so it doesn't block the FastAPI event loop.
+Multi-consumer asyncio queue. Provision jobs check out a template VMID from a
+pool (one entry per template configured in PHP_TEMPLATE_VMIDS) before cloning,
+which gives us N-way parallel provisioning: Proxmox serializes full clones per
+*source* VMID via an LVM-thin lock, so distinct source templates clone in
+parallel for real. Teardown / redeploy jobs don't touch a template and run on
+any free consumer.
 
-Compared to the previous threading.Lock + BackgroundTasks setup, jobs that are
-waiting their turn now sit on status='queued' instead of pretending to be
-provisioning — the UI can show queue position and the system stops looking
-frozen to the second/third user.
+`pvesh get /cluster/nextid` can return the same value to two callers that race
+it — handled by the proxmox_clone role's existing retry-on-"already exists"
+loop (the loser of the race rolls onto the next free VMID).
+
+Each job runs inside a thread executor so the long blocking subprocess.run on
+ansible-playbook doesn't stall the FastAPI event loop.
 """
 from __future__ import annotations
 
@@ -94,14 +97,15 @@ Job = ProvisionJob | TeardownJob | RedeployJob
 
 # Initialized in start_consumer() (needs to bind to the running event loop).
 _queue: asyncio.Queue[Job | None] | None = None
-_consumer_task: asyncio.Task | None = None
-_running_site_id: str | None = None  # id of the job currently executing, None if idle
+_consumer_tasks: list[asyncio.Task] = []
+_template_pool: asyncio.Queue[int] | None = None  # available template VMIDs
+_running_site_ids: set[str] = set()  # site_ids currently executing
 
 
 def queue_depth() -> int:
     """Pending + running jobs. Used as backpressure by the route layer."""
     pending = _queue.qsize() if _queue is not None else 0
-    running = 1 if _running_site_id is not None else 0
+    running = len(_running_site_ids)
     return pending + running
 
 
@@ -118,35 +122,68 @@ def queued_site_ids() -> list[str]:
 
 
 async def start_consumer(settings: Settings) -> None:
-    """Call from FastAPI startup. Idempotent."""
-    global _queue, _consumer_task
-    if _consumer_task is not None and not _consumer_task.done():
+    """Call from FastAPI startup. Idempotent.
+
+    Spawns one consumer task per configured template VMID. With a single
+    template the behaviour is identical to the old single-consumer setup.
+    """
+    global _queue, _template_pool
+    if _consumer_tasks and not all(t.done() for t in _consumer_tasks):
         return
+
+    vmids = settings.php_template_vmids or (
+        [settings.php_template_vmid] if settings.php_template_vmid > 0 else []
+    )
+    if not vmids:
+        log.warning("no PHP template VMIDs configured; worker will reject provisions")
+        vmids = []
+
     _queue = asyncio.Queue()
-    _consumer_task = asyncio.create_task(_consumer_loop(settings), name="provision-consumer")
-    log.info("provision consumer started")
+    _template_pool = asyncio.Queue()
+    for vmid in vmids:
+        _template_pool.put_nowait(vmid)
+
+    # Concurrency = number of templates (each provision claims one before
+    # cloning). At least one consumer always, so teardowns still drain even
+    # if no templates are configured (e.g. tearing down legacy sites).
+    concurrency = max(1, len(vmids))
+    _consumer_tasks.clear()
+    for i in range(concurrency):
+        task = asyncio.create_task(
+            _consumer_loop(settings), name=f"provision-consumer-{i}"
+        )
+        _consumer_tasks.append(task)
+    log.info(
+        "provision consumers started: concurrency=%d templates=%s", concurrency, vmids
+    )
 
 
 async def stop_consumer() -> None:
-    """Call from FastAPI shutdown. Drains the consumer cleanly via sentinel."""
-    global _queue, _consumer_task
-    if _consumer_task is None:
+    """Call from FastAPI shutdown. Drains consumers cleanly via sentinels."""
+    global _queue, _template_pool
+    if not _consumer_tasks:
         return
     if _queue is not None:
-        await _queue.put(None)  # sentinel; consumer exits after this
+        # One sentinel per consumer so each loop exits.
+        for _ in _consumer_tasks:
+            await _queue.put(None)
     try:
-        await asyncio.wait_for(_consumer_task, timeout=5)
+        await asyncio.wait_for(
+            asyncio.gather(*_consumer_tasks, return_exceptions=True), timeout=5
+        )
     except asyncio.TimeoutError:
-        log.warning("consumer did not exit in time; cancelling")
-        _consumer_task.cancel()
-    _consumer_task = None
+        log.warning("some consumers did not exit in time; cancelling")
+        for t in _consumer_tasks:
+            if not t.done():
+                t.cancel()
+    _consumer_tasks.clear()
     _queue = None
+    _template_pool = None
 
 
 async def _consumer_loop(settings: Settings) -> None:
-    """Single FIFO consumer. Runs each sync job in a thread executor so the
-    long-running subprocess.run calls don't block other API requests."""
-    global _running_site_id
+    """One of N FIFO consumers. Provision jobs additionally check out a
+    template VMID from the pool so concurrent clones target distinct sources."""
     assert _queue is not None
     loop = asyncio.get_running_loop()
     while True:
@@ -154,18 +191,27 @@ async def _consumer_loop(settings: Settings) -> None:
         try:
             if job is None:  # shutdown sentinel
                 return
-            _running_site_id = job.site_id
+            _running_site_ids.add(job.site_id)
             try:
                 if isinstance(job, ProvisionJob):
-                    await loop.run_in_executor(
-                        None,
-                        _provision_site_sync,
-                        settings,
-                        job.site_id,
-                        job.user_id,
-                        job.zip_path,
-                        job.subdomain,
-                    )
+                    # Block until a template is free. Concurrency naturally
+                    # matches the pool size since each consumer holds at most
+                    # one template at a time.
+                    assert _template_pool is not None
+                    template_vmid = await _template_pool.get()
+                    try:
+                        await loop.run_in_executor(
+                            None,
+                            _provision_site_sync,
+                            settings,
+                            job.site_id,
+                            job.user_id,
+                            job.zip_path,
+                            job.subdomain,
+                            template_vmid,
+                        )
+                    finally:
+                        _template_pool.put_nowait(template_vmid)
                 elif isinstance(job, RedeployJob):
                     await loop.run_in_executor(
                         None,
@@ -189,7 +235,7 @@ async def _consumer_loop(settings: Settings) -> None:
             except Exception:
                 log.exception("consumer crashed on job site_id=%s", job.site_id)
             finally:
-                _running_site_id = None
+                _running_site_ids.discard(job.site_id)
         finally:
             _queue.task_done()
 
@@ -232,7 +278,11 @@ def _set_status_safe(site_id: str, status: str, error: str | None = None) -> Non
 
 
 def _run_ansible(
-    settings: Settings, site_id: str, user_id: str, zip_path: Path
+    settings: Settings,
+    site_id: str,
+    user_id: str,
+    zip_path: Path,
+    template_vmid: int,
 ) -> tuple[int, str, str]:
     # Filename is `<slug>-<site_id>.zip`; recover the slug for human-readable hostnames.
     site_slug = zip_path.stem.removesuffix(f"-{site_id}") or "site"
@@ -247,7 +297,7 @@ def _run_ansible(
         "site_slug": site_slug,
         "zip_path": str(zip_path),
         "target_node": settings.proxmox_node,
-        "template_vmid": settings.php_template_vmid,
+        "template_vmid": template_vmid,
         "tenant_disk_gb": plan_limits.lxc_disk_gb,
     }
     try:
@@ -395,10 +445,12 @@ def _provision_site_sync(
     user_id: str,
     zip_path: Path,
     subdomain: str,
+    template_vmid: int,
 ) -> None:
     """Full pipeline for one upload. Runs on a thread executor so the calling
-    asyncio consumer stays responsive — but the consumer awaits this, so only
-    one provision pipeline executes at a time."""
+    asyncio consumer stays responsive. `template_vmid` is the PHP template
+    checked out from the pool by the consumer — distinct VMIDs let N pipelines
+    clone in parallel without hitting the same Proxmox source lock."""
     try:
         if settings.provisioner_backend not in SUPPORTED_BACKENDS:
             _set_status(
@@ -455,7 +507,9 @@ def _provision_site_sync(
         _set_status(site_id, STATUS_PROVISIONING)
 
         try:
-            rc, stdout, stderr = _run_ansible(settings, site_id, user_id, zip_path)
+            rc, stdout, stderr = _run_ansible(
+                settings, site_id, user_id, zip_path, template_vmid
+            )
         except subprocess.TimeoutExpired as exc:
             _set_status(
                 site_id,

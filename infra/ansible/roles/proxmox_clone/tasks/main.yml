@@ -2,47 +2,51 @@
 # Clone the PHP LXC template into a fresh, thin-provisioned tenant container.
 # Networking: DHCP on tenant_bridge (OPNsense hands out the lease).
 # Storage: tenant_disk_storage (local-lvm by default — thin provisioned).
+#
+# Concurrency note: with N parallel provisioning consumers (one per template
+# VMID), two clones can call `pvesh get /cluster/nextid` back-to-back and get
+# the same value. We MUST treat a "CT already exists" failure as "re-pick a
+# new VMID and retry", not as success — otherwise the loser of the race would
+# overwrite the winner's container with its own deploy. To keep pick+clone
+# atomic under that constraint, the loop lives in a single shell task.
 
-- name: Pick the next free VMID
-  ansible.builtin.command: pvesh get /cluster/nextid
-  register: nextid_out
-  changed_when: false
+- name: Pick next free VMID and clone template (collision-retry)
+  ansible.builtin.shell: |
+    set -u
+    for attempt in $(seq 1 10); do
+      new_vmid=$(pvesh get /cluster/nextid)
+      if out=$(pct clone {{ template_vmid }} ${new_vmid} \
+            --full 1 \
+            --storage {{ tenant_disk_storage }} \
+            --pool {{ tenant_pool }} \
+            --hostname {{ tenant_hostname }} 2>&1); then
+        echo "BRIEHOST_NEW_VMID=${new_vmid}"
+        exit 0
+      fi
+      echo "[attempt ${attempt}] clone failed: ${out}" >&2
+      # CT-already-exists = lost the nextid race; pick again immediately.
+      # lock-timeout / already-locked = another op holds the source template
+      # lock (parallel clone from same VMID, or human in the Proxmox UI);
+      # back off.
+      if echo "${out}" | grep -qE 'already exists'; then
+        continue
+      fi
+      if echo "${out}" | grep -qiE 'lock timeout|already locked'; then
+        sleep 6
+        continue
+      fi
+      # Unknown failure — bail immediately rather than masking it.
+      exit 1
+    done
+    echo "exhausted clone retries" >&2
+    exit 1
+  register: clone_out
+  changed_when: clone_out.rc == 0
+  # `set -u` + the loop give us deterministic failure on exhaustion.
 
-- name: Set new_vmid fact
+- name: Extract new_vmid from clone output
   ansible.builtin.set_fact:
-    new_vmid: "{{ nextid_out.stdout | trim }}"
-
-- name: Clone PHP template -> tenant CT (full clone, thin where supported)
-  community.proxmox.proxmox:
-    api_host: "{{ proxmox_api_host }}"
-    api_user: "{{ proxmox_api_user }}"
-    api_token_id: "{{ proxmox_api_token_id }}"
-    api_token_secret: "{{ proxmox_api_token_secret }}"
-    validate_certs: false
-    node: "{{ target_node }}"
-    vmid: "{{ new_vmid }}"
-    clone: "{{ template_vmid }}"
-    clone_type: full
-    storage: "{{ tenant_disk_storage }}"
-    pool: "{{ tenant_pool }}"
-    hostname: "{{ tenant_hostname }}"
-    timeout: 300
-  delegate_to: localhost
-  register: clone_result
-  # Retry on transient lock/race errors from Proxmox. The worker already
-  # serializes its own clones via a process-wide mutex, but a human poking
-  # the Proxmox UI can still create contention. Match on common phrases
-  # rather than HTTP codes — community.proxmox bubbles those up in `msg`.
-  retries: 5
-  delay: 6
-  until: >-
-    clone_result is succeeded or
-    not (
-      (clone_result.msg | default('') | regex_search('lock timeout', ignorecase=True)) or
-      (clone_result.msg | default('') | regex_search('already locked', ignorecase=True)) or
-      (clone_result.msg | default('') | regex_search('CT \\d+ already exists', ignorecase=True)) or
-      (clone_result.msg | default('') | regex_search('VM \\d+ already exists', ignorecase=True))
-    )
+    new_vmid: "{{ clone_out.stdout | regex_search('BRIEHOST_NEW_VMID=(\\d+)', '\\1') | first }}"
 
 - name: Configure tenant CT resources + network (DHCP via OPNsense)
   community.proxmox.proxmox:
